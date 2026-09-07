@@ -1,0 +1,35 @@
+# Real secret-leak risk found during Phase 12 Docker verification: with no
+# .dockerignore, `COPY . .` in the Dockerfile would bake .env (which holds
+# the real GROQ_API_KEY in this environment) directly into an image layer.
+# GROQ_API_KEY must be passed at container-run time (docker run -e / compose
+# environment) instead — see docker-compose.yml.
+.env
+
+# Not needed inside the image — the Dockerfile installs its own
+# dependencies via requirements.txt; copying the host's venv would bloat
+# the image with host-platform-specific wheels and is never used.
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# VCS metadata, not needed at runtime.
+.git/
+.gitignore
+
+# The prototype's live SQLite DB — the container should start fresh via
+# init_db() + POST /targets/seed, not inherit whatever real data happens to
+# be on the host at build time.
+als_pipeline.db
+
+# The React/TypeScript frontend is an entirely separate Node/Vite project,
+# not built or served by this Dockerfile (see docs/07 Phase 12) — excluding
+# it keeps the backend image's build context small and avoids ever copying
+# a local node_modules/ if one exists.
+figma_frontend/
+
+# Test/tooling artifacts, not needed at runtime.
+.pytest_cache/
+*.egg-info/
+.vscode/
+.idea/

@@ -1,0 +1,583 @@
+"""
+Real evidence ingestion for the 5 ALS candidate genes.
+
+Pulls evidence rows from the live Open Targets Platform API for each
+(gene, datasource) pair, normalizes them into EvidenceRecord rows using the
+source-type-specific field derivation discovered via live GraphQL
+introspection (see CLAUDE.md "Important discovery"), and saves them to the
+database.
+
+Datasources actually queried for this MVP run:
+    europepmc            -> literature
+    clinical_precedence  -> human_clinical
+    impc                 -> experimental (phase 2 — stored with
+        source-type fields populated, but evidence_score is left None since
+        no phase-2 scorer exists yet in dimension_scoring.py)
+
+Genetic evidence is NOT a hardcoded datasource list here — it's fetched via
+OTP's real "genetic_association" datatype (config.GENETIC_DATATYPE_ID,
+open_targets_client.get_evidence_by_datatype()). A hardcoded list
+(previously `eva`/`uniprot_variants`/`gwas_credible_sets`, chosen because
+these dominate ALS's rare-variant genetics) silently under-collected real
+evidence in two confirmed ways: it never included `orphanet` (a real
+datasourceId under the same datatype nobody had anticipated), and each
+per-datasource fetch was separately capped at `size` (200), silently
+truncating `eva`'s real 275 SOD1 rows down to 200. Both are fixed by
+fetching the whole datatype, discovered and paginated dynamically — see
+open_targets_client.get_evidence_by_datatype()'s docstring and docs/07
+"Genetic evidence: datatype-driven fetch" for the live schema check and
+real before/after SOD1 numbers.
+
+Low-volume datasources seen during exploration under the "genetic_literature"
+datatype (genomics_england, clingen, uniprot_literature — 1-2 rows each for
+SOD1) are still skipped for this MVP; documented limitation, not an
+oversight. `orphanet` is NOT in this skip list — it's a real
+"genetic_association" datasourceId (1 SOD1 row) and is now included
+automatically via the datatype-driven genetic fetch above.
+
+In addition to OTP's `europepmc`, this script also pulls a second,
+independent literature source directly from PubMed (see
+app/ingestion/literature_client.py) — `data_source="pubmed"`, still
+`dimension="literature"`. This is deliberately a much simpler
+presence-based signal (confidence always 1.0), not a duplicate of OTP's own
+NLP-scored evidence; see that module's docstring for why.
+
+Also ingests Pathway evidence (`dimension="pathway"`, `data_source="reactome"`)
+via `get_pathway_evidence()` — a disease-agnostic Target.pathways lookup,
+NOT an evidences()-based datasource (confirmed live: pathway/Reactome
+evidence does not exist through evidences() for any of these 5 genes at
+all). Real counts vary by gene (SOD1: 3, FUS: 4, NEK1: 1, C9orf72: 0,
+TARDBP: 0) — genuinely reflects each gene's real Reactome annotations, not
+a missing-data artifact.
+
+Run:
+    python -m scripts.ingest_evidence
+"""
+
+from app.config import (
+    DISEASE_EFO_ID, DISEASE_NAME, CANDIDATE_TARGETS, GENETIC_DATATYPE_ID,
+    EXPRESSION_ATLAS_DATASOURCE_ID,
+)
+from app.db.database import SessionLocal, init_db
+from app.db.models import Target, EvidenceRecord
+from app.ingestion.open_targets_client import (
+    get_evidence_for_datasource, get_evidence_by_datatype, get_pathway_evidence,
+    get_drug_target_evidence,
+)
+from app.ingestion.literature_client import get_literature_evidence_pubmed
+from app.ingestion.hpa_client import get_tissue_expression
+from app.ingestion.string_client import get_ppi_partners
+from app.core.scoring.dimension_scoring import (
+    score_genetic_l2g,
+    score_clinical_precedence,
+    score_literature_cooccurrence,
+    score_pathway_curated,
+    score_experimental,
+    score_omics_expression,
+    score_drug_target,
+    score_tissue_specificity,
+    score_ppi_hub,
+)
+
+# Non-genetic dimensions: real ALS data shows exactly one real OTP
+# datasourceId per datatype here (literature -> europepmc, human_clinical
+# -> clinical_precedence, experimental -> impc), so a hardcoded 1:1 mapping
+# carries no under-collection risk the way genetic's multi-datasource list
+# did (see GENETIC_DATATYPE_ID below and docs/07). A different disease
+# COULD have more than one real datasourceId under one of these datatypes
+# too — same class of risk, not fixed here since it wasn't observed for any
+# of the 5 real genes and is out of this task's scope; named as related
+# follow-up work in docs/07.
+DATASOURCE_TO_DIMENSION = {
+    "europepmc": "literature",
+    "clinical_precedence": "human_clinical",
+    "impc": "experimental",
+    # New (this task). Real, confirmed-in-schema datasourceId — see
+    # config.EXPRESSION_ATLAS_DATASOURCE_ID's docstring for why this
+    # returns zero real rows for every gene in this project's actual data.
+    EXPRESSION_ATLAS_DATASOURCE_ID: "omics",
+}
+
+DIMENSION_TO_SOURCE_TYPE = {
+    "genetic": "genetic",
+    "literature": "literature",
+    "human_clinical": "clinical",
+    "experimental": "experimental",
+    "omics": "omics",
+    "drug_target": "clinical",  # see config.SOURCE_TYPE_BY_DATA_SOURCE's "chembl_drug_target" entry
+}
+
+# Substrings checked (case-insensitive) against OTP's trialStopReasonCategories
+# to decide the early-stop down-weight in score_clinical_precedence().
+TRIAL_STOP_NEGATIVE_KEYWORDS = ("negative", "safety", "adverse")
+
+
+def _normalize_direction(raw: str | None) -> str | None:
+    """OTP returns lowercase ('risk'/'protective'); classifier/tests use Title case."""
+    return raw.strip().capitalize() if raw else None
+
+
+def _first_or_none(values: list | None):
+    return values[0] if values else None
+
+
+def _scalarize(value):
+    """
+    Some OTP fields documented/assumed scalar (e.g. biosamplesFromSource)
+    can come back as a list for real rows — confirmed live for the first
+    time by SNCA's real expression_atlas data (['UBERON_0001966']), which
+    crashed the insert because every string-typed EvidenceRecord column
+    only accepts a scalar. Join list values into one comparable string,
+    same convention this file already uses for clinicalSignificances/
+    allelicRequirements/phenotype lists, rather than assume scalar and
+    fail on insert.
+
+    Applied defensively (this task) to three more fields with the same
+    risk, none ever observed as a list in real data yet: variantRsId
+    (_build_genetic_fields), drugFromSource (_build_clinical_fields), and
+    HPA's rna_tissue_distribution (_build_tissue_expression_fields) — same
+    reasoning as biosamplesFromSource: these are comparability/display
+    fields where joining preserves real information without corrupting
+    anything downstream. NOT applied to clinical_stage/max_clinical_stage
+    in dimension_scoring.py — those feed a dict lookup keyed on one exact
+    stage string, where silently joining would produce a key that matches
+    nothing and falls back to "unknown", silently under-scoring real
+    evidence; those raise loudly instead (see
+    dimension_scoring._require_scalar_stage()).
+    """
+    if isinstance(value, list):
+        return "; ".join(str(v) for v in value) or None
+    return value
+
+
+def _year_from_date_string(date_str: str | None) -> int | None:
+    """Real OTP date fields (e.g. "2025-12-11") -> real year, or None if
+    not a real parseable date. Used for Evidence Momentum — see
+    app/db/models.py's EvidenceRecord.publication_year docstring."""
+    if not date_str or len(date_str) < 4 or not date_str[:4].isdigit():
+        return None
+    return int(date_str[:4])
+
+
+def _build_genetic_fields(row: dict) -> dict:
+    """
+    eva / uniprot_variants / gwas_credible_sets: no population/tissue/assay/
+    endpoint fields exist (confirmed via live introspection). Real
+    comparability fields instead: variant_id, clinical_significance
+    (ClinVar term), inheritance_pattern (from allelicRequirements).
+    """
+    clinical_significances = row.get("clinicalSignificances") or []
+    allelic_requirements = row.get("allelicRequirements") or []
+    raw_score = row.get("score")
+    return dict(
+        source_type="genetic",
+        source_record_id=row.get("studyId") or row["id"],
+        raw_value=raw_score,
+        evidence_score=score_genetic_l2g(raw_score),
+        variant_id=_scalarize(row.get("variantRsId")),
+        clinical_significance="; ".join(clinical_significances) or None,
+        inheritance_pattern="; ".join(allelic_requirements) or None,
+        direction_on_trait=_normalize_direction(row.get("directionOnTrait")),
+        direction_on_target=_normalize_direction(row.get("directionOnTarget")),
+        notes=f"disease_from_source={row.get('diseaseFromSource')}",
+    )
+
+
+def _build_literature_fields(row: dict) -> dict:
+    """
+    europepmc: no structured comparability fields at all (confirmed via live
+    introspection) — left null intentionally, not a bug. `score` is OTP's
+    already-normalized co-occurrence confidence (observed as 1 for all
+    included rows); `resourceScore` is the raw, unbounded underlying value,
+    kept in raw_value for traceability.
+    """
+    return dict(
+        source_type="literature",
+        source_record_id=_first_or_none(row.get("literature")) or row["id"],
+        raw_value=row.get("resourceScore"),
+        evidence_score=score_literature_cooccurrence(row.get("score") or 0.0),
+        # Real, confirmed reliably populated (5/5 real SOD1 sample rows) —
+        # see EvidenceRecord.publication_year's docstring.
+        publication_year=row.get("publicationYear"),
+    )
+
+
+def _build_clinical_fields(row: dict) -> dict:
+    """
+    clinical_precedence: confirmed via live introspection across all 5
+    candidate genes (docs/06_evidence_heterogeneity_discovery.md) that
+    `population` and `endpoint` do NOT populate for this dataset at all
+    (ancestry/cohort*/studyCases all null/empty on every row, every gene) —
+    left null, not forced. `drugFromSource` is the only real comparability
+    field (`intervention`), but its casing is inconsistent for the same real
+    drug (e.g. "tofersen" vs "TOFERSEN") — lowercased here so two records
+    about the same drug don't spuriously mismatch in the classifier.
+    `trialStopReasonCategories`/`trialWhyStopped` are also empty on every
+    row for every gene, so `stopped_early` can never evaluate True from real
+    data — the down-weight logic is exercised, but not triggered, by this
+    dataset; documented limitation, not a bug.
+    """
+    stop_categories = [c.lower() for c in (row.get("trialStopReasonCategories") or [])]
+    stopped_early = any(k in c for c in stop_categories for k in TRIAL_STOP_NEGATIVE_KEYWORDS)
+    clinical_stage = row.get("clinicalStage") or "unknown"
+    drug = _scalarize(row.get("drugFromSource"))
+    return dict(
+        source_type="clinical",
+        source_record_id=row["id"],
+        raw_value=row.get("score"),
+        evidence_score=score_clinical_precedence(clinical_stage, stopped_early),
+        intervention=drug.lower() if drug else None,
+        notes=f"disease_from_source={row.get('diseaseFromSource')}",
+        # Real, but confirmed MOSTLY NULL in this dataset (4 of 5 real SOD1
+        # sample rows) — see EvidenceRecord.publication_year's docstring;
+        # a real, honest data gap, not forced.
+        publication_year=_year_from_date_string(row.get("studyStartDate")),
+    )
+
+
+def _build_experimental_fields(row: dict) -> dict:
+    """
+    impc: confirmed via live introspection across all 5 candidate genes that
+    `tissue` and `assay_type` do NOT populate (cellType/biosamplesFromSource/
+    contrast/statisticalMethod/assessments all null/empty on every row) —
+    left null, not forced onto a substitute field. `phenotype` IS real and
+    rich: diseaseModelAssociatedModelPhenotypes (mouse-model phenotype
+    labels, e.g. "motor neuron degeneration") and the human-side
+    diseaseModelAssociatedHumanPhenotypes (e.g. "Fasciculations") are joined
+    together, since both describe the same underlying model-to-human
+    evidence chain. `evidence_score` now real (this task) — see
+    score_experimental()'s docstring: OTP's own `score` field on real impc
+    rows is already a pre-computed, normalized 0-1 result (confirmed via a
+    real SOD1 sample: score=0.5807, resourceScore=58.07), so this reuses it
+    directly rather than re-deriving a q-value/significance formula OTP has
+    already computed.
+    """
+    model_phenotypes = [p["label"] for p in (row.get("diseaseModelAssociatedModelPhenotypes") or [])]
+    human_phenotypes = [p["label"] for p in (row.get("diseaseModelAssociatedHumanPhenotypes") or [])]
+    phenotype = "; ".join(model_phenotypes + human_phenotypes) or None
+    return dict(
+        source_type="experimental",
+        source_record_id=row["id"],
+        raw_value=row.get("score"),
+        evidence_score=score_experimental(row.get("score")),
+        phenotype=phenotype,
+        notes=f"allelic_composition={row.get('biologicalModelAllelicComposition')}",
+    )
+
+
+def _build_omics_fields(row: dict) -> dict:
+    """
+    expression_atlas: real, schema-confirmed fields (log2FoldChangeValue,
+    log2FoldChangePercentileRank, pValueMantissa, pValueExponent) — see
+    config.EXPRESSION_ATLAS_DATASOURCE_ID's docstring for why this
+    datasource returns zero real rows for every ALS/CF gene tested so far.
+    Built correctly against real field names anyway, per this task's
+    "introspect first" instruction. UPDATE (Parkinson's smoke test): this
+    datasource returned real data for the first time ever for SNCA, and
+    `biosamplesFromSource` came back as a list rather than the assumed
+    scalar — see _scalarize()'s docstring.
+    """
+    log2fc = row.get("log2FoldChangeValue")
+    p_mantissa = row.get("pValueMantissa")
+    p_exponent = row.get("pValueExponent")
+    percentile_rank = row.get("log2FoldChangePercentileRank")
+    return dict(
+        source_type="omics",
+        source_record_id=row.get("studyId") or row["id"],
+        raw_value=row.get("resourceScore"),
+        evidence_score=score_omics_expression(log2fc, p_mantissa, p_exponent, percentile_rank),
+        tissue=_scalarize(row.get("biosamplesFromSource")),
+        notes=f"log2fc={log2fc}; disease_from_source={row.get('diseaseFromSource')}",
+    )
+
+
+def _build_pathway_fields(row: dict) -> dict:
+    """
+    Reactome pathway membership (Target.pathways — disease-agnostic, see
+    open_targets_client.get_pathway_evidence() docstring). Every real
+    pathway hit scores a fixed 1.0 via score_pathway_curated(), matching
+    OTP's own convention for curated pathway evidence.
+    """
+    return dict(
+        dimension="pathway",
+        data_source="reactome",
+        source_type="pathway",
+        source_record_id=row["pathwayId"],
+        raw_value=1.0,
+        evidence_score=score_pathway_curated(is_curated=True),
+        notes=f"pathway={row['pathway'].strip()}; top_level_term={row['topLevelTerm']}",
+    )
+
+
+_FIELD_BUILDERS = {
+    "genetic": _build_genetic_fields,
+    "literature": _build_literature_fields,
+    "human_clinical": _build_clinical_fields,
+    "experimental": _build_experimental_fields,
+    "omics": _build_omics_fields,
+}
+
+
+def _build_drug_target_fields(row: dict) -> dict:
+    """
+    Real ChEMBL-backed drug-target mechanism data (Target.
+    drugAndClinicalCandidates — see open_targets_client.get_drug_target_evidence()
+    docstring for why this is a different real API path than
+    clinical_precedence, already disease-filtered by that function).
+    `intervention` is lowercased for the same reason
+    _build_clinical_fields() lowercases `drugFromSource` — so this and
+    clinical_precedence's intervention values collapse to one real drug
+    name rather than splitting on casing when compared as the same
+    "clinical" source-type group.
+    """
+    drug = row["drug"]
+    moa_rows = drug.get("mechanismsOfAction", {}).get("rows", []) if drug.get("mechanismsOfAction") else []
+    moa_text = "; ".join(f"{r['mechanismOfAction']} ({r['actionType']})" for r in moa_rows) or None
+    return dict(
+        dimension="drug_target",
+        data_source="chembl_drug_target",
+        source_type="clinical",
+        source_record_id=drug["id"],  # real ChEMBL id, e.g. CHEMBL3833346
+        raw_value=None,  # no single real numeric raw input — see score_drug_target()'s docstring
+        evidence_score=score_drug_target(row.get("maxClinicalStage")),
+        intervention=drug["name"].lower() if drug.get("name") else None,
+        notes=f"drug_type={drug.get('drugType')}; max_clinical_stage={row.get('maxClinicalStage')}; mechanism_of_action={moa_text}",
+    )
+
+
+def _build_tissue_expression_fields(hpa_data: dict, ensembl_id: str) -> dict:
+    """
+    Human Protein Atlas tissue expression (see app/ingestion/hpa_client.py
+    docstring). ONE real row per gene — HPA's real signal is a single
+    gene-level categorical summary, not independently-combinable pieces of
+    evidence, so this mirrors _build_pathway_fields()'s "one aggregate row"
+    pattern rather than the many-rows-per-gene pattern genetic/literature
+    evidence uses. `tissue` reuses the existing generic column (real value:
+    HPA's own "RNA tissue distribution" category, e.g. "Detected in all").
+    """
+    specificity = hpa_data.get("rna_tissue_specificity")
+    distribution = hpa_data.get("rna_tissue_distribution")
+    enriched_tissues = list((hpa_data.get("rna_tissue_specific_nTPM") or {}).keys())
+    return dict(
+        dimension="tissue_expression",
+        data_source="hpa",
+        source_type="tissue_expression",
+        source_record_id=f"hpa:{ensembl_id}",
+        raw_value=None,  # HPA gives a category, not a single real numeric input — see score_tissue_specificity()
+        evidence_score=score_tissue_specificity(specificity),
+        tissue=_scalarize(distribution),
+        notes=f"specificity_category={specificity}; enriched_tissues={', '.join(enriched_tissues) or 'none'}",
+    )
+
+
+def _build_ppi_network_fields(partners: list[dict], gene_symbol: str) -> dict:
+    """
+    STRING protein-protein interaction network context (see
+    app/ingestion/string_client.py docstring). ONE real row per gene, same
+    "aggregate gene-level signal" reasoning as
+    _build_tissue_expression_fields() above — the hub score is inherently
+    a function of the WHOLE partner count, not any single partner in
+    isolation, so storing N per-partner rows and harmonic-summing them
+    would double-count/distort the aggregate rather than reproduce it.
+    Real partner names kept in `notes` for traceability (the actual
+    per-partner records are not individually persisted, but are not lost
+    either — visible in this row's own notes).
+    """
+    partner_count = len(partners)
+    partner_names = [p["preferredName_B"] for p in partners]
+    return dict(
+        dimension="ppi_network",
+        data_source="string",
+        source_type="ppi_network",
+        source_record_id=f"string:{gene_symbol}",
+        raw_value=float(partner_count),
+        evidence_score=score_ppi_hub(partner_count),
+        notes=f"high_confidence_partner_count={partner_count}; partners={', '.join(partner_names) or 'none'}",
+    )
+
+
+def _save_evidence(db, record: EvidenceRecord, gene_symbol: str, label: str) -> bool:
+    """
+    Commits ONE evidence record independently, isolated from every other
+    record for this gene. Previously, ingest_target() staged an entire
+    gene's evidence in one transaction with a single commit() at the end —
+    a real, confirmed bug: one malformed row (SNCA's list-valued
+    expression_atlas `tissue` field, see _scalarize()) raised a
+    sqlite3.ProgrammingError that rolled back EVERY already-staged record
+    for that gene (genetic, literature, clinical, pathway, drug-target —
+    all of it, despite having ingested successfully). Committing per-record
+    means a bad row costs only itself.
+    """
+    db.add(record)
+    try:
+        db.commit()
+        return True
+    except Exception as exc:
+        db.rollback()
+        print(f"  [{gene_symbol}] {label}: 1 row FAILED to save ({exc}), skipping just this row")
+        return False
+
+
+def ingest_target(db, gene_symbol: str, ensembl_id: str) -> int:
+    target = db.query(Target).filter_by(ensembl_id=ensembl_id).first()
+    if target is None:
+        target = Target(gene_symbol=gene_symbol, ensembl_id=ensembl_id, disease_efo_id=DISEASE_EFO_ID)
+        db.add(target)
+        db.commit()  # target itself must survive independently of any evidence row below
+
+    saved = 0
+
+    # Genetic: fetched by real OTP datatype ("genetic_association"),
+    # discovered + fully paginated — NOT a hardcoded datasourceId list. See
+    # module docstring and open_targets_client.get_evidence_by_datatype().
+    try:
+        genetic_rows = get_evidence_by_datatype(ensembl_id, DISEASE_EFO_ID, GENETIC_DATATYPE_ID)
+    except Exception as exc:
+        print(f"  [{gene_symbol}] {GENETIC_DATATYPE_ID}: query failed ({exc}), skipping")
+        genetic_rows = []
+    real_datasources = sorted({row["datasourceId"] for row in genetic_rows})
+    for row in genetic_rows:
+        record = EvidenceRecord(
+            target_id=target.id,
+            dimension="genetic",
+            data_source=row["datasourceId"],
+            **_build_genetic_fields(row),
+        )
+        if _save_evidence(db, record, gene_symbol, row["datasourceId"]):
+            saved += 1
+    print(f"  [{gene_symbol}] {GENETIC_DATATYPE_ID} ({real_datasources or 'none'}): {len(genetic_rows)} rows ingested")
+
+    for datasource_id, dimension in DATASOURCE_TO_DIMENSION.items():
+        try:
+            rows = get_evidence_for_datasource(ensembl_id, DISEASE_EFO_ID, datasource_id)
+        except Exception as exc:
+            print(f"  [{gene_symbol}] {datasource_id}: query failed ({exc}), skipping")
+            continue
+
+        builder = _FIELD_BUILDERS[dimension]
+        for row in rows:
+            record = EvidenceRecord(
+                target_id=target.id,
+                dimension=dimension,
+                data_source=datasource_id,
+                **builder(row),
+            )
+            if _save_evidence(db, record, gene_symbol, datasource_id):
+                saved += 1
+        print(f"  [{gene_symbol}] {datasource_id}: {len(rows)} rows ingested")
+
+    # Second, independent literature source — direct PubMed co-occurrence,
+    # not routed through OTP at all (see literature_client.py docstring).
+    try:
+        pubmed_rows = get_literature_evidence_pubmed(gene_symbol, DISEASE_NAME)
+    except Exception as exc:
+        print(f"  [{gene_symbol}] pubmed: query failed ({exc}), skipping")
+        pubmed_rows = []
+    for row in pubmed_rows:
+        record = EvidenceRecord(
+            target_id=target.id,
+            dimension="literature",
+            data_source="pubmed",
+            source_type="literature",
+            source_record_id=row["pmid"],
+            raw_value=row["confidence"],
+            evidence_score=score_literature_cooccurrence(row["confidence"]),
+            # Real year via a real NCBI esummary lookup (this task) — see
+            # literature_client.get_publication_years()'s docstring.
+            publication_year=row.get("year"),
+        )
+        if _save_evidence(db, record, gene_symbol, "pubmed"):
+            saved += 1
+    print(f"  [{gene_symbol}] pubmed: {len(pubmed_rows)} rows ingested")
+
+    # Pathway: disease-agnostic Reactome membership (Target.pathways, NOT
+    # evidences() — see open_targets_client.get_pathway_evidence()
+    # docstring for the live-confirmed reason).
+    try:
+        pathway_rows = get_pathway_evidence(ensembl_id)
+    except Exception as exc:
+        print(f"  [{gene_symbol}] reactome: query failed ({exc}), skipping")
+        pathway_rows = []
+    for row in pathway_rows:
+        record = EvidenceRecord(target_id=target.id, **_build_pathway_fields(row))
+        if _save_evidence(db, record, gene_symbol, "reactome"):
+            saved += 1
+    print(f"  [{gene_symbol}] reactome: {len(pathway_rows)} rows ingested")
+
+    # Drug-Target: real ChEMBL-backed mechanism-of-action data
+    # (Target.drugAndClinicalCandidates, NOT evidences() — see
+    # open_targets_client.get_drug_target_evidence() docstring for the
+    # live-confirmed reason, same discovery pattern as pathway above).
+    # Already disease-filtered by that function.
+    try:
+        drug_target_rows = get_drug_target_evidence(ensembl_id, DISEASE_EFO_ID)
+    except Exception as exc:
+        print(f"  [{gene_symbol}] chembl_drug_target: query failed ({exc}), skipping")
+        drug_target_rows = []
+    for row in drug_target_rows:
+        record = EvidenceRecord(target_id=target.id, **_build_drug_target_fields(row))
+        if _save_evidence(db, record, gene_symbol, "chembl_drug_target"):
+            saved += 1
+    print(f"  [{gene_symbol}] chembl_drug_target: {len(drug_target_rows)} rows ingested")
+
+    # Tissue Expression: real Human Protein Atlas data — a genuinely
+    # independent external source (not Open Targets, see
+    # app/ingestion/hpa_client.py docstring), handled gracefully like every
+    # other real external API call here: log and continue, never abort.
+    try:
+        hpa_data = get_tissue_expression(ensembl_id)
+    except Exception as exc:
+        print(f"  [{gene_symbol}] hpa: query failed ({exc}), skipping")
+        hpa_data = None
+    if hpa_data is not None:
+        record = EvidenceRecord(target_id=target.id, **_build_tissue_expression_fields(hpa_data, ensembl_id))
+        if _save_evidence(db, record, gene_symbol, "hpa"):
+            saved += 1
+            print(f"  [{gene_symbol}] hpa: 1 row ingested (specificity={hpa_data.get('rna_tissue_specificity')})")
+    else:
+        print(f"  [{gene_symbol}] hpa: 0 rows ingested (no real HPA record for this gene)")
+
+    # PPI Network: real STRING high-confidence interaction partners —
+    # another genuinely independent external source, same graceful
+    # error-handling convention. IMPORTANT: a real query failure (network/
+    # rate-limit) is NOT the same as a real, confirmed zero-partner result
+    # (score_ppi_hub(0) == 0.0, a genuine low score) — conflating the two
+    # would silently fabricate a "confirmed isolated protein" finding out
+    # of an API timeout, so a failed query skips the row entirely, exactly
+    # like every other source's failure path above.
+    try:
+        ppi_partners = get_ppi_partners(gene_symbol)
+    except Exception as exc:
+        print(f"  [{gene_symbol}] string: query failed ({exc}), skipping")
+        ppi_partners = None
+    if ppi_partners is not None:
+        record = EvidenceRecord(target_id=target.id, **_build_ppi_network_fields(ppi_partners, gene_symbol))
+        if _save_evidence(db, record, gene_symbol, "string"):
+            saved += 1
+            print(f"  [{gene_symbol}] string: 1 row ingested ({len(ppi_partners)} real high-confidence partners)")
+
+    return saved
+
+
+def main():
+    init_db()
+    db = SessionLocal()
+    try:
+        # Prototype re-run behavior: clear prior ingestion rather than
+        # accumulating duplicates on every run.
+        deleted = db.query(EvidenceRecord).delete()
+        if deleted:
+            db.commit()
+            print(f"Cleared {deleted} existing evidence records before re-ingesting.\n")
+
+        grand_total = 0
+        for gene_symbol, ensembl_id in CANDIDATE_TARGETS.items():
+            print(f"Ingesting {gene_symbol} ({ensembl_id})...")
+            grand_total += ingest_target(db, gene_symbol, ensembl_id)
+        print(f"\nDone. {grand_total} evidence records ingested across {len(CANDIDATE_TARGETS)} targets.")
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    main()

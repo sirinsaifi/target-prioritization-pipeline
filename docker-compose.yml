@@ -1,0 +1,35 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      # Real gap found during Phase 12 Docker verification: python-dotenv's
+      # load_dotenv() (app/main.py) only reads a real .env FILE, which is
+      # correctly excluded from the image now (see .dockerignore) — so
+      # without this line, GROQ_API_KEY would never reach the container at
+      # all, and every LLM-backed endpoint (literature contradictions,
+      # narration, the investigation loop) would fail with the existing
+      # "no key" RuntimeError even when the host has a real key configured.
+      # Requires GROQ_API_KEY to be set in the host shell (or a
+      # docker-compose .env file) before `docker compose up` — not baked
+      # into this file, never committed as a literal value.
+      - GROQ_API_KEY=${GROQ_API_KEY}
+    # NOTE: the SQLite DB (als_pipeline.db) lives inside the container's
+    # filesystem and is NOT persisted across `docker compose down` — this
+    # matches the prototype's existing "SQLite for prototype simplicity"
+    # design (see app/db/database.py). Add a bind mount or switch to
+    # Postgres before this matters for anything beyond a demo.
+
+  ui:
+    build: .
+    command: ["streamlit", "run", "streamlit_app.py", "--server.address", "0.0.0.0", "--server.port", "8501"]
+    ports:
+      - "8501:8501"
+    environment:
+      # UI container reaches the API container by service name, not
+      # "localhost" — see streamlit_app.py's module docstring.
+      - API_BASE_URL=http://api:8000
+    depends_on:
+      - api

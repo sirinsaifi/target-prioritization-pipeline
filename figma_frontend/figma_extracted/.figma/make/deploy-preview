@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# When source extraction is on, build in development mode so React keeps
+# _debugStack/_debugOwner — HTML-to-Design needs them to attribute source.
+if [ "${EMIT_SOURCEMAPS:-}" = "true" ]; then
+  pnpm run build -- --mode development
+else
+  pnpm run build
+fi
+figma make deploy-preview --build-dir dist
