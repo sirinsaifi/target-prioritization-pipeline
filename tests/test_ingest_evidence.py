@@ -21,10 +21,13 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.db.database import Base
-from app.db.models import Target, EvidenceRecord
+from app.db.models import (
+    Target, EvidenceRecord, ContradictionLog, GapRecord, PriorityScore, PipelineRunLog,
+)
 from scripts.ingest_evidence import (
     _build_omics_fields, _build_genetic_fields, _build_clinical_fields,
     _build_tissue_expression_fields, _scalarize, _save_evidence, ingest_target,
+    clear_evidence_and_downstream_analysis,
 )
 
 
@@ -242,3 +245,102 @@ def test_ingest_target_survives_one_dimension_failing(db_session, monkeypatch):
     assert "pathway" in dims
     assert "drug_target" in dims
     assert saved == len(records)
+
+
+# --- Bug 3: stale/mismatched downstream analysis rows surviving a
+# re-ingestion, referencing evidence-record ids reused by a DIFFERENT gene
+# (real bug found cleaning up an orphaned NEK1 ContradictionLog row) ------
+
+def test_clear_evidence_and_downstream_analysis_removes_everything(db_session):
+    """
+    Reproduces the real bug end-to-end: ingest evidence for a target, run
+    contradictions/gaps/scoring against it (simulated here with direct
+    ORM rows rather than the real classifier/scorer, since only the
+    clearing behavior is under test), then simulate a re-ingestion refresh
+    for the SAME target by calling clear_evidence_and_downstream_analysis().
+    Every downstream table must come back empty — not just EvidenceRecord —
+    so no stale row can later resolve against a different gene's reused ids.
+    """
+    target = Target(gene_symbol="SOD1", ensembl_id="ENSG00000142168", disease_efo_id="MONDO_0004976")
+    db_session.add(target)
+    db_session.commit()
+
+    rec_a = EvidenceRecord(target_id=target.id, dimension="literature", data_source="europepmc", source_record_id="pmid1")
+    rec_b = EvidenceRecord(target_id=target.id, dimension="literature", data_source="europepmc", source_record_id="pmid2")
+    db_session.add_all([rec_a, rec_b])
+    db_session.commit()
+
+    db_session.add(ContradictionLog(
+        target_id=target.id, evidence_record_a_id=rec_a.id, evidence_record_b_id=rec_b.id,
+        classification="literature_contradiction", status="confirmed", proposed_by="llm_proposer",
+    ))
+    db_session.add(GapRecord(target_id=target.id, gap_type="mechanistic", rationale="stale rationale"))
+    db_session.add(PriorityScore(target_id=target.id, priority_score=0.5, dimension_breakdown="{}"))
+    db_session.add(PipelineRunLog(target_id=target.id, stage="contradictions"))
+    db_session.add(PipelineRunLog(target_id=target.id, stage="gaps"))
+    db_session.commit()
+
+    assert db_session.query(EvidenceRecord).count() == 2
+    assert db_session.query(ContradictionLog).count() == 1
+    assert db_session.query(GapRecord).count() == 1
+    assert db_session.query(PriorityScore).count() == 1
+    assert db_session.query(PipelineRunLog).count() == 2
+
+    counts = clear_evidence_and_downstream_analysis(db_session)
+
+    assert counts == {
+        "contradiction_log": 1, "gap_records": 1, "priority_scores": 1,
+        "pipeline_run_log": 2, "evidence_records": 2,
+    }
+    assert db_session.query(EvidenceRecord).count() == 0
+    assert db_session.query(ContradictionLog).count() == 0
+    assert db_session.query(GapRecord).count() == 0
+    assert db_session.query(PriorityScore).count() == 0
+    assert db_session.query(PipelineRunLog).count() == 0
+
+
+def test_clear_evidence_and_downstream_analysis_prevents_cross_gene_id_reuse_mismatch(db_session):
+    """
+    The exact real scenario found in production: target A (NEK1-like) gets
+    a ContradictionLog row referencing its own evidence records. A full
+    re-ingestion (target A refreshed, or a brand-new target B ingested
+    after A) is simulated by clearing, then inserting FRESH evidence rows
+    that happen to land on the SAME auto-increment ids (guaranteed here by
+    starting from a clean in-memory DB) but for a DIFFERENT target. Without
+    clearing ContradictionLog too, the old row would now silently resolve
+    to target B's real evidence — a wrong-but-plausible answer. With the
+    fix, the old row is gone before the id reuse can even happen.
+    """
+    target_a = Target(gene_symbol="NEK1", ensembl_id="ENSG00000137601", disease_efo_id="MONDO_0004976")
+    db_session.add(target_a)
+    db_session.commit()
+
+    rec_a1 = EvidenceRecord(target_id=target_a.id, dimension="literature", data_source="europepmc", source_record_id="pmidA1")
+    rec_a2 = EvidenceRecord(target_id=target_a.id, dimension="literature", data_source="europepmc", source_record_id="pmidA2")
+    db_session.add_all([rec_a1, rec_a2])
+    db_session.commit()
+    stale_ids = (rec_a1.id, rec_a2.id)
+
+    db_session.add(ContradictionLog(
+        target_id=target_a.id, evidence_record_a_id=rec_a1.id, evidence_record_b_id=rec_a2.id,
+        classification="literature_contradiction", status="confirmed", proposed_by="llm_proposer",
+    ))
+    db_session.commit()
+
+    # Simulate a full re-ingestion: clear everything, then a different
+    # gene's evidence happens to be inserted first and lands on the exact
+    # same reused primary keys.
+    clear_evidence_and_downstream_analysis(db_session)
+
+    target_b = Target(gene_symbol="FUS", ensembl_id="ENSG00000089280", disease_efo_id="MONDO_0004976")
+    db_session.add(target_b)
+    db_session.commit()
+    rec_b1 = EvidenceRecord(target_id=target_b.id, dimension="literature", data_source="europepmc", source_record_id="pmidB1")
+    rec_b2 = EvidenceRecord(target_id=target_b.id, dimension="literature", data_source="europepmc", source_record_id="pmidB2")
+    db_session.add_all([rec_b1, rec_b2])
+    db_session.commit()
+
+    assert (rec_b1.id, rec_b2.id) == stale_ids  # confirms the id-reuse premise actually holds in this test
+    # The old ContradictionLog row must be gone — not surviving to silently
+    # resolve against target_b's new rows at the same ids.
+    assert db_session.query(ContradictionLog).count() == 0

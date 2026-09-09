@@ -24,10 +24,13 @@ def test_system_prompt_template_reflects_the_disease_passed_in_not_als():
 
 
 def test_investigate_target_sends_the_real_disease_to_the_llm_not_a_hardcoded_one():
-    # Mock the one function that talks to the network (same pattern as
-    # tests/test_agent_narrator.py) so this proves what's actually built
-    # into the messages sent to the model, with no real API call.
-    with patch("app.agent.investigation_loop.call_llm_with_tools") as mock_call:
+    # Mock the two functions that talk to the network (the reasoning call
+    # and the tool-calling call — see investigation_loop.py's two-call
+    # architecture) so this proves what's actually built into the messages
+    # sent to the model, with no real API call.
+    with patch("app.agent.investigation_loop.call_llm_with_tools") as mock_call, \
+         patch("app.agent.investigation_loop.call_llm_plain") as mock_plain:
+        mock_plain.return_value = "stub reasoning"
         mock_call.return_value = {"role": "assistant", "content": "stub final message", "tool_calls": None}
         result = investigate_target("ZZZFAKE9", "Fictional Test Syndrome", max_iterations=2)
 
@@ -42,3 +45,15 @@ def test_investigate_target_sends_the_real_disease_to_the_llm_not_a_hardcoded_on
     for leaked in LEAKED_ALS_TERMS:
         assert leaked not in system_message
         assert leaked not in user_message
+
+    # The separate reasoning call must be equally disease-agnostic — it
+    # builds its own messages from scratch (see _get_step_reasoning()).
+    mock_plain.assert_called_once()
+    (reasoning_messages,) = mock_plain.call_args[0]
+    reasoning_system = reasoning_messages[0]["content"]
+    reasoning_user = reasoning_messages[1]["content"]
+    assert "Fictional Test Syndrome" in reasoning_system
+    assert "ZZZFAKE9" in reasoning_user
+    for leaked in LEAKED_ALS_TERMS:
+        assert leaked not in reasoning_system
+        assert leaked not in reasoning_user

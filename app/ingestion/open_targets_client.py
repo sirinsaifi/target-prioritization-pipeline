@@ -80,6 +80,8 @@ _EVIDENCE_FIELDS = """
     log2FoldChangePercentileRank
     pValueMantissa
     pValueExponent
+    clinicalReportId
+    credibleSet { studyLocusId }
 """
 
 
@@ -312,6 +314,183 @@ def get_drug_target_evidence(ensembl_id: str, efo_id: str) -> list[dict]:
         row for row in all_rows
         if any(d["disease"] and d["disease"]["id"] == efo_id for d in row["diseases"])
     ]
+
+
+def get_prioritisation_and_safety(ensembl_id: str) -> dict:
+    """
+    Real Open Targets Target Prioritisation Factors — Known Safety Events
+    and Genetic Constraint (platform.opentargets.org/disease/{id}/
+    associations?table=prioritisations). Both are gene-level, disease-
+    agnostic TARGET annotations (Target.geneticConstraint,
+    Target.safetyLiabilities, Target.prioritisation), NOT evidences() rows
+    — same "target annotation, not per-disease evidence" pattern as
+    get_pathway_evidence()/get_drug_target_evidence() above. Deliberately
+    excludes every structural/druggability prioritisation factor
+    (hasLigand, hasPocket, hasSmallMoleculeBinder, isInMembrane,
+    isSecreted, etc.) — out of this project's scope per this task's own
+    instruction; only the two factors requested are queried.
+
+    REAL FIELD SEMANTICS, confirmed via platform-docs.opentargets.org
+    (not guessed — the raw API values alone were genuinely ambiguous, see
+    module docstring below for the mis-read that live-checking caught):
+    - `prioritisation.items` "geneticConstraint": OTP's own already-scaled
+      factor score, -1 (least tolerant to loss-of-function — a highly
+      constrained, likely-essential gene) to +1 (most tolerant — "generally
+      favorable... for drugging targets" per OTP's own docs). Derived from
+      gnomAD's LOEUF metric; the raw per-constraint-type rows (`exp`/`obs`/
+      `oe`/`score`, one row each for synonymous/missense/LoF variation) are
+      ALSO fetched here for traceability in `notes`, not re-derived.
+    - `prioritisation.items` "hasSafetyEvent": a real, if confusingly-
+      signed, boolean flag — value "-1" means "the target HAS at least one
+      documented adverse event"; the key being ABSENT from `items` entirely
+      means "no information available" (confirmed live: this key was
+      missing from SOD1's real items list, present with "-1" for KCNH2/
+      hERG and TP53, both of which also have real non-empty
+      `safetyLiabilities`). The raw `safetyLiabilities` list itself (real
+      per-event name/datasource/tissue/effect-direction) is the ground-
+      truth data actually stored — this flag is only cross-referenced, not
+      relied on alone, since it was found ABSENT even for some targets
+      with a real, populated safetyLiabilities list in earlier live checks
+      against other genes during this task's validation.
+    """
+    query = """
+    query PrioritisationAndSafety($ensemblId: String!) {
+      target(ensemblId: $ensemblId) {
+        geneticConstraint {
+          constraintType
+          score
+          exp
+          obs
+          oe
+        }
+        safetyLiabilities {
+          event
+          eventId
+          datasource
+          url
+          biosamples { tissueLabel }
+          effects { dosing direction }
+        }
+        prioritisation {
+          items { key value }
+        }
+      }
+    }
+    """
+    data = _run_query(query, {"ensemblId": ensembl_id})
+    target_data = data.get("target") or {}
+    items = {i["key"]: i["value"] for i in (target_data.get("prioritisation") or {}).get("items", [])}
+    return {
+        "genetic_constraint_rows": target_data.get("geneticConstraint", []),
+        "genetic_constraint_prioritisation": items.get("geneticConstraint"),
+        "has_safety_event_flag": items.get("hasSafetyEvent"),
+        "safety_liabilities": target_data.get("safetyLiabilities", []),
+    }
+
+
+def get_essentiality_and_paralogues(ensembl_id: str) -> dict:
+    """
+    Two more real Open Targets Target Prioritisation Factors — Gene
+    Essentiality and Paralogues (platform.opentargets.org/disease/{id}/
+    associations?table=prioritisations). Both are gene-level,
+    disease-agnostic TARGET annotations (Target.isEssential,
+    Target.depMapEssentiality, Target.homologues, Target.prioritisation),
+    NOT evidences() rows — same pattern as get_prioritisation_and_safety()
+    above. Confirmed via live GraphQL introspection BEFORE writing this
+    query (not assumed): `isEssential` (Boolean), `depMapEssentiality`
+    (list of {tissueId, tissueName, screens: [{geneEffect, depmapId,
+    cellLineName, diseaseFromSource, mutation, expression}]}), and
+    `homologues` (list of {speciesId, speciesName, homologyType,
+    targetGeneId, targetGeneSymbol, queryPercentageIdentity,
+    targetPercentageIdentity, isHighConfidence}) are all real Target-level
+    fields — none of this comes through evidences().
+
+    REAL FIELD SEMANTICS, confirmed via platform-docs.opentargets.org/
+    web-interface/target-prioritisation (not guessed — see module docstring
+    precedent set by get_prioritisation_and_safety() for why this project
+    checks docs before interpreting a -1/0/+1 value):
+
+    - `prioritisation.items` "geneEssentiality": UNFAVORABLE-for-drugging
+      direction, and NOT continuous like geneticConstraint — it is a
+      binary call. "-1 = Target reported as essential" (a poor
+      therapeutic target due to safety concerns); "0 = Target not reported
+      as essential" (a favorable/neutral position, not a true midpoint).
+      Derived from DepMap's own CRISPR screening data across cancer cell
+      lines: DepMap calls a gene "common essential" when its gene-effect
+      rank falls in "the 90th percentile least" dependent cell line (i.e.
+      consistently required for survival across most of the panel). The
+      raw per-cell-line `geneEffect` scores (CERES/Chronos gene-effect,
+      one row per real DepMap screen) are ALSO fetched here for
+      traceability in `notes`, not re-derived into our own threshold —
+      OTP's own binary call is treated as ground truth, the same
+      "reuse OTP's own already-computed call" discipline as
+      get_prioritisation_and_safety()'s hasSafetyEvent handling.
+    - `prioritisation.items` "paralogMaxIdentityPercentage": also
+      UNFAVORABLE-for-drugging direction (higher paralogue sequence
+      similarity = more off-target/redundancy risk), on a 0 to -1 scale —
+      "Below 0 to -1 are linearly scored those targets with at least one
+      paralogue in [human] sharing >=60% identity" (more negative = higher
+      identity); "0 = Those targets with paralogues harbouring less than
+      60% of identity" (paralogues exist but are NOT concerning by OTP's
+      own threshold). Absent from `items` entirely = NA, no real paralogue
+      data available for this gene. Derived from Ensembl Compara homology
+      calls, measuring max sequence identity between a gene and its real
+      human paralogues.
+    - `Target.homologues`: the REAL per-paralogue/ortholog rows this
+      summary factor is built from. `homologyType == "ortholog_one2one"`
+      rows are CROSS-SPECIES (a different species' equivalent gene, not a
+      paralogue at all); `homologyType == "other_paralog"` rows with
+      `speciesId == "9606"` (human) ARE the real, same-species paralogues
+      this project cares about — confirmed live for SOD1 (2 real human
+      paralogues: CCS at ~47% identity, SOD3 at ~40%), FUS (2 real human
+      paralogues: EWSR1 at ~56%, TAF15 at ~45% — the real, well-known FET
+      protein family), and TARDBP (24 real human "paralogue" hits, but at
+      much LOWER identity, mostly 8-20% — a large, loosely-related
+      RRM-domain-sharing superfamily, e.g. ELAVL1-4/PABPC1-5/HNRNPR/
+      RBM14/24/34/38/45/RBMS1-3/SYNCRIP/PUF60/SF3B4, not a tight paralogue
+      cluster the way FUS's 2 hits are) — confirmed this is a real,
+      biologically meaningful distinction the raw identity percentage
+      captures and a bare paralogue COUNT would misrepresent.
+    """
+    query = """
+    query EssentialityAndParalogues($ensemblId: String!) {
+      target(ensemblId: $ensemblId) {
+        isEssential
+        depMapEssentiality {
+          tissueId
+          tissueName
+          screens { geneEffect }
+        }
+        homologues {
+          speciesId
+          speciesName
+          homologyType
+          targetGeneId
+          targetGeneSymbol
+          queryPercentageIdentity
+          targetPercentageIdentity
+        }
+        prioritisation {
+          items { key value }
+        }
+      }
+    }
+    """
+    data = _run_query(query, {"ensemblId": ensembl_id})
+    target_data = data.get("target") or {}
+    items = {i["key"]: i["value"] for i in (target_data.get("prioritisation") or {}).get("items", [])}
+    homologues = target_data.get("homologues") or []
+    human_paralogues = [
+        h for h in homologues
+        if h.get("speciesId") == "9606" and h.get("homologyType") != "ortholog_one2one"
+    ]
+    return {
+        "is_essential": target_data.get("isEssential"),
+        "gene_essentiality_prioritisation": items.get("geneEssentiality"),
+        "depmap_essentiality_rows": target_data.get("depMapEssentiality", []),
+        "paralog_max_identity_prioritisation": items.get("paralogMaxIdentityPercentage"),
+        "human_paralogues": human_paralogues,
+    }
 
 
 if __name__ == "__main__":

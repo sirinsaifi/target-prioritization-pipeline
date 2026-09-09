@@ -13,6 +13,7 @@ outside this file — see docs/07 Phase 7 for that output.
 import json
 from unittest.mock import patch
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -20,11 +21,24 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.core.verification.literature_contradiction_proposer import (
-    _parse_response, propose_literature_contradiction,
+    _parse_response, _configured_provider, propose_literature_contradiction,
 )
 from app.core.verification.literature_contradiction_verifier import verify_literature_contradiction
 from app.core.scoring.evidence_profile import compute_evidence_consistency
+from app.core.llm_client import call_llm_plain_biomedical, HUGGINGFACE_ROUTER_URL
 from app.db.models import EvidenceRecord
+
+
+def _make_groq_rate_limit_error():
+    """A real groq.RateLimitError, constructed the way the groq SDK itself
+    requires (message + a real httpx.Response) — used to simulate the
+    documented, repeatedly-real 429 this project's free-tier Groq key hits
+    (see CLAUDE.md)."""
+    import groq
+
+    request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+    response = httpx.Response(status_code=429, request=request, json={"error": {"message": "rate limit"}})
+    return groq.RateLimitError("Rate limit reached", response=response, body=None)
 
 
 # --- Plain-text response parsing (the design lesson from Phase 8: no JSON, no tool-calling) ---
@@ -64,6 +78,18 @@ def test_parse_response_takes_only_the_first_line_of_a_reason_that_ran_on():
     assert reason == "They discuss different genes."
 
 
+def test_parse_response_strips_a_leaked_chat_template_closing_tag():
+    # Real artifact, found live testing the biomedical model
+    # (Intelligent-Internet/II-Medical-8B via HuggingFace): it sometimes
+    # wraps its reply in its own internal "<Answer>...</Answer>" tag; the
+    # closing tag lands on the same line as REASON's text and must not leak
+    # into the stored reason.
+    raw = "<Answer>CLASSIFICATION: UNRELATED  \nREASON: Different topics entirely.</Answer>"
+    classification, reason = _parse_response(raw)
+    assert classification == "UNRELATED"
+    assert reason == "Different topics entirely."
+
+
 # --- propose_literature_contradiction(): plain-text call, no tool-calling involved ---
 
 def test_propose_literature_contradiction_builds_the_exact_requested_prompt_and_parses_the_mocked_reply():
@@ -98,6 +124,117 @@ def test_propose_literature_contradiction_handles_an_unparseable_reply_without_r
 
     assert result["classification"] is None
     assert result["raw_response"] == "Sorry, I cannot classify this."
+
+
+def test_propose_literature_contradiction_defaults_to_groq_provider(monkeypatch):
+    monkeypatch.delenv("LITERATURE_LLM_PROVIDER", raising=False)
+    with patch("app.core.verification.literature_contradiction_proposer.call_llm_plain") as mock_call:
+        mock_call.return_value = "CLASSIFICATION: SUPPORT\nREASON: Same direction reported."
+        result = propose_literature_contradiction("SOD1", "ALS", "text a", "text b")
+
+    assert result["provider"] == "groq"
+    mock_call.assert_called_once()
+
+
+# --- Biomedical LLM option (new task): additional provider, not a
+# replacement — see app/config.py's "biomedical LLM option" comment for the
+# real, live-confirmed model-availability finding behind BIOMEDICAL_LLM_MODEL ---
+
+def test_configured_provider_defaults_to_groq_when_env_var_unset(monkeypatch):
+    monkeypatch.delenv("LITERATURE_LLM_PROVIDER", raising=False)
+    assert _configured_provider() == "groq"
+
+
+def test_configured_provider_reads_biomedical_from_env(monkeypatch):
+    monkeypatch.setenv("LITERATURE_LLM_PROVIDER", "biomedical")
+    assert _configured_provider() == "biomedical"
+
+
+def test_configured_provider_is_case_insensitive_and_tolerates_whitespace(monkeypatch):
+    monkeypatch.setenv("LITERATURE_LLM_PROVIDER", "  BioMedical  ")
+    assert _configured_provider() == "biomedical"
+
+
+def test_configured_provider_falls_back_to_groq_for_an_unrecognized_value(monkeypatch):
+    # Never silently guess a provider the code doesn't actually implement.
+    monkeypatch.setenv("LITERATURE_LLM_PROVIDER", "chatgpt")
+    assert _configured_provider() == "groq"
+
+
+def test_propose_literature_contradiction_uses_biomedical_llm_when_configured(monkeypatch):
+    monkeypatch.setenv("LITERATURE_LLM_PROVIDER", "biomedical")
+    with patch("app.core.verification.literature_contradiction_proposer._call_biomedical_llm") as mock_bio, \
+         patch("app.core.verification.literature_contradiction_proposer.call_llm_plain") as mock_groq:
+        mock_bio.return_value = "CLASSIFICATION: CONTRADICT\nREASON: Domain-specific reasoning here."
+        result = propose_literature_contradiction("SOD1", "ALS", "text a", "text b")
+
+    assert result["classification"] == "CONTRADICT"
+    assert result["provider"] == "biomedical"
+    mock_bio.assert_called_once()
+    mock_groq.assert_not_called()  # groq path never touched at all when biomedical is configured
+
+
+def test_propose_literature_contradiction_falls_back_to_biomedical_on_groq_rate_limit(monkeypatch):
+    # The real, repeatedly-observed scenario this session (Groq's free-tier
+    # 200,000 token/day cap hit mid-run) — with a biomedical fallback
+    # configured (HUGGINGFACE_API_TOKEN present), the check must not simply
+    # fail; it should transparently retry via the biomedical model.
+    monkeypatch.delenv("LITERATURE_LLM_PROVIDER", raising=False)
+    monkeypatch.setenv("HUGGINGFACE_API_TOKEN", "fake-token-for-test")
+    with patch("app.core.verification.literature_contradiction_proposer.call_llm_plain") as mock_groq, \
+         patch("app.core.verification.literature_contradiction_proposer._call_biomedical_llm") as mock_bio:
+        mock_groq.side_effect = _make_groq_rate_limit_error()
+        mock_bio.return_value = "CLASSIFICATION: SUPPORT\nREASON: Both report the same risk direction."
+        result = propose_literature_contradiction("SOD1", "ALS", "text a", "text b")
+
+    assert result["classification"] == "SUPPORT"
+    assert result["provider"] == "biomedical_fallback"
+    mock_groq.assert_called_once()
+    mock_bio.assert_called_once()
+
+
+def test_propose_literature_contradiction_reraises_rate_limit_when_no_fallback_configured(monkeypatch):
+    # No HUGGINGFACE_API_TOKEN at all -> nothing to fall back to; the real
+    # error must propagate, never be swallowed into a fabricated result.
+    monkeypatch.delenv("LITERATURE_LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("HUGGINGFACE_API_TOKEN", raising=False)
+    with patch("app.core.verification.literature_contradiction_proposer.call_llm_plain") as mock_groq, \
+         patch("app.core.verification.literature_contradiction_proposer._call_biomedical_llm") as mock_bio:
+        mock_groq.side_effect = _make_groq_rate_limit_error()
+        with pytest.raises(Exception):  # groq.RateLimitError, re-raised unchanged
+            propose_literature_contradiction("SOD1", "ALS", "text a", "text b")
+
+    mock_bio.assert_not_called()
+
+
+# --- call_llm_plain_biomedical(): the raw HuggingFace Inference Providers call ---
+
+def test_call_llm_plain_biomedical_raises_without_a_token(monkeypatch):
+    monkeypatch.delenv("HUGGINGFACE_API_TOKEN", raising=False)
+    with pytest.raises(RuntimeError, match="HUGGINGFACE_API_TOKEN"):
+        call_llm_plain_biomedical([{"role": "user", "content": "hi"}])
+
+
+def test_call_llm_plain_biomedical_calls_the_router_and_parses_the_reply(monkeypatch):
+    monkeypatch.setenv("HUGGINGFACE_API_TOKEN", "fake-token-for-test")
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"choices": [{"message": {"content": "CLASSIFICATION: UNRELATED\nREASON: Different topic."}}]}
+
+    with patch("requests.post") as mock_post:
+        mock_post.return_value = FakeResponse()
+        result = call_llm_plain_biomedical([{"role": "user", "content": "hi"}])
+
+    assert result == "CLASSIFICATION: UNRELATED\nREASON: Different topic."
+    mock_post.assert_called_once()
+    args, kwargs = mock_post.call_args
+    assert args[0] == HUGGINGFACE_ROUTER_URL
+    assert kwargs["headers"]["Authorization"] == "Bearer fake-token-for-test"
+    assert ":" in kwargs["json"]["model"]  # "<hf_model_id>:<provider>" addressing
 
 
 # --- verify_literature_contradiction(): deterministic, no LLM call ---
@@ -268,3 +405,22 @@ def test_route_404s_for_unknown_target(client_with_test_db):
     client, _ = client_with_test_db
     response = client.post("/contradictions/target/999/run-literature")
     assert response.status_code == 404
+
+
+def test_route_records_biomedical_provider_in_proposed_by(client_with_test_db, monkeypatch):
+    # When the biomedical LLM actually produced the proposal, the persisted
+    # row must say so — distinct from the default "llm_proposer" (Groq)
+    # string, same self-describing convention as "structured_classifier" vs
+    # "llm_proposer" already documented on ContradictionLog.
+    monkeypatch.setenv("LITERATURE_LLM_PROVIDER", "biomedical")
+    client, SessionLocal = client_with_test_db
+    target_id = _seed_target_with_literature(SessionLocal, n=2)
+
+    with patch("app.core.verification.literature_contradiction_proposer._call_biomedical_llm") as mock_bio:
+        mock_bio.return_value = "CLASSIFICATION: CONTRADICT\nREASON: Opposite direction reported."
+        response = client.post(f"/contradictions/target/{target_id}/run-literature")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["contradictions"]) == 1
+    assert body["contradictions"][0]["proposed_by"] == "llm_proposer_biomedical"

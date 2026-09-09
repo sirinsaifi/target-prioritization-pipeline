@@ -246,6 +246,73 @@ def test_no_gaps_when_everything_is_covered():
     assert identify_gaps(summary) == []
 
 
+def test_no_gaps_when_everything_is_covered_including_safety():
+    # Extends the fixture above with has_safety_signal explicitly False —
+    # confirms adding the new field doesn't change the "everything clean"
+    # baseline behavior for existing targets (real ALS data: all 5 real
+    # genes currently show zero documented safety events — see CLAUDE.md).
+    summary = TargetEvidenceSummary(
+        gene_symbol="TEST2",
+        dimension_scores={"genetic": 0.9},
+        evidence_strength=0.9,
+        evidence_consistency=0.9,
+        evidence_maturity=0.9,
+        has_pathway_evidence=True,
+        has_human_clinical_evidence=True,
+        has_known_compound=True,
+        has_safety_signal=False,
+    )
+    assert identify_gaps(summary) == []
+
+
+def test_safety_signal_gap_triggers_with_strong_evidence_and_a_real_documented_event():
+    # Real data has never triggered this path (see CLAUDE.md — all 5 real
+    # ALS genes show zero documented safety events) — constructed
+    # directly, same pattern as other real-but-unexercised branches in
+    # this codebase (e.g. the contradiction classifier's null-handling
+    # case).
+    summary = TargetEvidenceSummary(
+        gene_symbol="KCNH2",
+        dimension_scores={"genetic": 0.9},
+        evidence_strength=0.9,
+        evidence_consistency=0.9,
+        evidence_maturity=0.9,
+        has_pathway_evidence=True,
+        has_human_clinical_evidence=True,
+        has_known_compound=True,
+        has_safety_signal=True,
+        safety_signal_events=["prolongation of QT interval of ECG", "Torsades de Point"],
+    )
+    findings = {g.gap_type: g for g in identify_gaps(summary)}
+    assert "safety_signal" in findings
+    rationale = findings["safety_signal"].rationale
+    suggestion = findings["safety_signal"].investigation_suggestion
+    assert "2 documented safety event(s)" in rationale
+    assert "prolongation of QT interval of ECG" in rationale
+    assert "does not automatically disqualify" in suggestion
+    assert "KCNH2" in suggestion
+
+
+def test_safety_signal_gap_suppressed_when_evidence_strength_is_low():
+    # Explicit design decision (this task): a target that isn't otherwise
+    # a strong candidate doesn't trigger this gap even with a real
+    # documented event — see identify_gaps()'s own comment for why.
+    summary = TargetEvidenceSummary(
+        gene_symbol="WEAKGENE",
+        dimension_scores={"genetic": 0.2},
+        evidence_strength=0.2,
+        evidence_consistency=0.9,
+        evidence_maturity=0.9,
+        has_pathway_evidence=True,
+        has_human_clinical_evidence=True,
+        has_known_compound=True,
+        has_safety_signal=True,
+        safety_signal_events=["some event"],
+    )
+    gap_types = [g.gap_type for g in identify_gaps(summary)]
+    assert "safety_signal" not in gap_types
+
+
 def test_pathway_registered_as_its_own_source_type():
     # Reactome membership (see open_targets_client.get_pathway_evidence)
     # has no direction/comparability concept at all — must map to an empty

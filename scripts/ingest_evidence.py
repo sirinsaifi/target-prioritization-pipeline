@@ -54,19 +54,23 @@ Run:
     python -m scripts.ingest_evidence
 """
 
+import statistics
+
 from app.config import (
     DISEASE_EFO_ID, DISEASE_NAME, CANDIDATE_TARGETS, GENETIC_DATATYPE_ID,
-    EXPRESSION_ATLAS_DATASOURCE_ID,
+    EXPRESSION_ATLAS_DATASOURCE_ID, PARALOGUE_MODALITY_NOTE_IDENTITY_THRESHOLD,
 )
 from app.db.database import SessionLocal, init_db
-from app.db.models import Target, EvidenceRecord
+from app.db.models import Target, EvidenceRecord, ContradictionLog, GapRecord, PriorityScore, PipelineRunLog
 from app.ingestion.open_targets_client import (
     get_evidence_for_datasource, get_evidence_by_datatype, get_pathway_evidence,
-    get_drug_target_evidence,
+    get_drug_target_evidence, get_prioritisation_and_safety, get_essentiality_and_paralogues,
 )
 from app.ingestion.literature_client import get_literature_evidence_pubmed
+from app.ingestion.clinicaltrials_gov_client import get_clinical_trials
 from app.ingestion.hpa_client import get_tissue_expression
-from app.ingestion.string_client import get_ppi_partners
+from app.ingestion.gtex_client import get_median_tissue_expression
+from app.ingestion.string_client import get_ppi_partners, get_string_id
 from app.core.scoring.dimension_scoring import (
     score_genetic_l2g,
     score_clinical_precedence,
@@ -77,6 +81,7 @@ from app.core.scoring.dimension_scoring import (
     score_drug_target,
     score_tissue_specificity,
     score_ppi_hub,
+    compute_tau_specificity,
 )
 
 # Non-genetic dimensions: real ALS data shows exactly one real OTP
@@ -165,10 +170,18 @@ def _build_genetic_fields(row: dict) -> dict:
     endpoint fields exist (confirmed via live introspection). Real
     comparability fields instead: variant_id, clinical_significance
     (ClinVar term), inheritance_pattern (from allelicRequirements).
+
+    `external_id`: real `credibleSet.studyLocusId`, populated ONLY for
+    gwas_credible_sets rows (null for eva/uniprot_variants/orphanet, whose
+    real external ids already live in source_record_id/variant_id instead)
+    — captured for a real, clickable source link to the Open Targets
+    Platform's own credible-set page, see
+    app/core/presentation/source_links.py.
     """
     clinical_significances = row.get("clinicalSignificances") or []
     allelic_requirements = row.get("allelicRequirements") or []
     raw_score = row.get("score")
+    credible_set = row.get("credibleSet") or {}
     return dict(
         source_type="genetic",
         source_record_id=row.get("studyId") or row["id"],
@@ -179,7 +192,55 @@ def _build_genetic_fields(row: dict) -> dict:
         inheritance_pattern="; ".join(allelic_requirements) or None,
         direction_on_trait=_normalize_direction(row.get("directionOnTrait")),
         direction_on_target=_normalize_direction(row.get("directionOnTarget")),
+        external_id=credible_set.get("studyLocusId"),
         notes=f"disease_from_source={row.get('diseaseFromSource')}",
+    )
+
+
+def _build_genetic_constraint_fields(gene_symbol: str, prioritisation_value: str | None, raw_rows: list[dict]) -> dict:
+    """
+    Real Open Targets Target Prioritisation Factor: Genetic Constraint
+    (see open_targets_client.get_prioritisation_and_safety()'s docstring
+    for the real -1..+1 scale and its confirmed meaning). Folded into the
+    EXISTING "genetic" dimension as one more real, disease-agnostic
+    annotation (same "gene-level, not disease-specific" pattern as
+    pathway/drug_target being folded into their own dimensions) — this is
+    a single aggregate row per gene, not a per-variant row.
+
+    HONEST FRAMING, worth restating at the point of use, not just in the
+    client's docstring: this measures TOLERABILITY TO LOSS-OF-FUNCTION (a
+    druggability/safety-adjacent signal — can this gene likely be
+    knocked down without being lethal), NOT disease-association strength.
+    A high score here does not mean "strong evidence this gene causes the
+    disease" — it means "perturbing this gene is less likely to be
+    intrinsically harmful". Scaled 0-1 via a plain linear remap of OTP's
+    own real -1..+1 value (0=least tolerant/most constrained, 1=most
+    tolerant) — not a new, invented formula.
+
+    Given harmonic_sum_score_scaled_for_type() combines this with
+    potentially hundreds of real per-variant genetic rows for the same
+    gene, one more real data point here has a correspondingly small (but
+    real, non-zero) effect on the aggregate genetic dimension score —
+    exactly as it should, since this is one annotation among many, not a
+    replacement for the disease-specific variant evidence.
+    """
+    evidence_score = round((float(prioritisation_value) + 1) / 2, 4) if prioritisation_value is not None else None
+    lof_row = next((r for r in raw_rows if r.get("constraintType") == "lof"), None)
+    lof_text = (
+        f"lof_oe={lof_row['oe']:.4f} (obs={lof_row['obs']}, exp={lof_row['exp']:.2f}, score={lof_row['score']})"
+        if lof_row else "real lof constraint row unavailable"
+    )
+    return dict(
+        dimension="genetic",
+        data_source="ot_genetic_constraint",
+        source_type="genetic",
+        source_record_id=f"ot_genetic_constraint:{gene_symbol}",
+        raw_value=float(prioritisation_value) if prioritisation_value is not None else None,
+        evidence_score=evidence_score,
+        notes=(
+            f"prioritisation_geneticConstraint={prioritisation_value} "
+            f"(scale: -1=least tolerant to LoF/most constrained, +1=most tolerant); {lof_text}"
+        ),
     )
 
 
@@ -216,6 +277,13 @@ def _build_clinical_fields(row: dict) -> dict:
     row for every gene, so `stopped_early` can never evaluate True from real
     data — the down-weight logic is exercised, but not triggered, by this
     dataset; documented limitation, not a bug.
+
+    `external_id`: real `clinicalReportId` — confirmed live this is
+    SOMETIMES a real ClinicalTrials.gov NCT id (e.g. "nct07223723") and
+    sometimes a different internal report tag with no public page (e.g.
+    "d0i1cq/amyotrophic lateral sclerosis"); captured verbatim here,
+    format-validated later at read time by
+    app/core/presentation/source_links.py before ever building a link.
     """
     stop_categories = [c.lower() for c in (row.get("trialStopReasonCategories") or [])]
     stopped_early = any(k in c for c in stop_categories for k in TRIAL_STOP_NEGATIVE_KEYWORDS)
@@ -227,11 +295,73 @@ def _build_clinical_fields(row: dict) -> dict:
         raw_value=row.get("score"),
         evidence_score=score_clinical_precedence(clinical_stage, stopped_early),
         intervention=drug.lower() if drug else None,
+        external_id=row.get("clinicalReportId"),
         notes=f"disease_from_source={row.get('diseaseFromSource')}",
         # Real, but confirmed MOSTLY NULL in this dataset (4 of 5 real SOD1
         # sample rows) — see EvidenceRecord.publication_year's docstring;
         # a real, honest data gap, not forced.
         publication_year=_year_from_date_string(row.get("studyStartDate")),
+    )
+
+
+_CTGOV_PHASE_NUMBERS = {"PHASE1": "1", "PHASE2": "2", "PHASE3": "3", "PHASE4": "4"}
+
+
+def _map_ctgov_phases_to_clinical_stage(phases: list[str]) -> str:
+    """
+    Real CT.gov `phases` (e.g. ["PHASE1"], ["PHASE1","PHASE2"], ["NA"],
+    ["EARLY_PHASE1"]) -> this project's own clinical_stage key convention
+    already used by dimension_scoring.CLINICAL_STAGE_SCORES (e.g.
+    "phase_1", "phase_1_2") — confirmed live these real CT.gov enum values
+    map cleanly 1:1 onto the existing keys, no new stage vocabulary needed.
+    """
+    real_phases = [p for p in phases if p and p != "NA"]
+    if not real_phases:
+        return "unknown"
+    if real_phases == ["EARLY_PHASE1"]:
+        return "early_phase_1"
+    numbers = [_CTGOV_PHASE_NUMBERS[p] for p in real_phases if p in _CTGOV_PHASE_NUMBERS]
+    return f"phase_{'_'.join(numbers)}" if numbers else "unknown"
+
+
+def _build_ctgov_clinical_fields(row: dict) -> dict:
+    """
+    clinicaltrials_gov: a second, independent human_clinical source (see
+    app/ingestion/clinicaltrials_gov_client.py's module docstring for the
+    real gap this closes — BIIB078/WVE-004 for C9orf72, missing entirely
+    from clinical_precedence). Reuses score_clinical_precedence() unchanged
+    (this task's own instruction) — same phase->stage mapping and
+    early-stop down-weight logic as clinical_precedence, just fed from
+    CT.gov's real fields instead of OTP's.
+
+    HONEST LIMITATION, not silently patched: `stopped_early` reuses the
+    exact same TRIAL_STOP_NEGATIVE_KEYWORDS ("negative"/"safety"/"adverse")
+    clinical_precedence already uses, checked against CT.gov's real
+    free-text `why_stopped` here (clinical_precedence's own
+    trialStopReasonCategories is a structured list this field has no
+    equivalent of). Confirmed live: NEITHER BIIB078's nor WVE-004's real
+    whyStopped text contains any of these 3 words (their real language is
+    "no evidence of benefit" / "no clinical benefit was seen" — a
+    lack-of-efficacy finding, not explicitly "negative/safety/adverse"), so
+    stopped_early evaluates False for both real trials and they score on
+    clinical_stage alone, without the 0.5x down-weight. Reported as a real
+    finding for this task, not expanded here — expanding the keyword list
+    is a separate, deliberate decision, not a side effect of adding this
+    source.
+    """
+    why_stopped = (row.get("why_stopped") or "").lower()
+    stopped_early = any(k in why_stopped for k in TRIAL_STOP_NEGATIVE_KEYWORDS)
+    clinical_stage = _map_ctgov_phases_to_clinical_stage(row.get("phases") or [])
+    intervention = row.get("intervention_name")
+    return dict(
+        source_type="clinical",
+        source_record_id=row["nct_id"],
+        raw_value=None,  # CT.gov has no single real numeric input analogous to OTP's `score` — see score_clinical_precedence()
+        evidence_score=score_clinical_precedence(clinical_stage, stopped_early),
+        intervention=intervention.lower() if intervention else None,
+        external_id=row["nct_id"],  # always a real, well-formed NCT id — see app/core/presentation/source_links.py
+        notes=f"status={row.get('overall_status')}; brief_title={row.get('brief_title')}; why_stopped={row.get('why_stopped')}",
+        publication_year=_year_from_date_string(row.get("start_date")),
     )
 
 
@@ -309,6 +439,173 @@ def _build_pathway_fields(row: dict) -> dict:
     )
 
 
+def _build_safety_signal_fields(row: dict) -> dict:
+    """
+    Real Open Targets Target Prioritisation Factor: Known Safety Events
+    (Target.safetyLiabilities — disease-agnostic, see
+    open_targets_client.get_prioritisation_and_safety()'s docstring). ONE
+    real row per documented event (a gene can have several real, distinct
+    events — e.g. real hERG/KCNH2 data returns 5 — each independently
+    traceable to its own real datasource), not one aggregate row, since
+    each event is its own real claim.
+
+    DELIBERATELY NOT SCORED 0-1 like every other dimension (this task's
+    own design question, answered here): `evidence_score` is left None on
+    purpose. This guarantees a documented safety concern can NEVER be
+    silently averaged into evidence_strength/dimension_breakdown
+    (app/api/routes/scoring.py only aggregates records whose
+    evidence_score is non-null) or into evidence_maturity ("safety_signal"
+    is deliberately NOT a key in config.DIMENSION_MATURITY_LADDER, so
+    DIMENSION_MATURITY_LADDER.get(d, 0.0) always contributes 0.0 for it —
+    it can never be the max rung). A real safety concern is categorically
+    different from "how much evidence exists" — it's surfaced instead via
+    a dedicated new gap type (gap_taxonomy.GAP_TEMPLATES["safety_signal"])
+    and a prominent frontend warning banner, never blended into a score
+    that could hide it.
+    """
+    tissues = [b["tissueLabel"] for b in (row.get("biosamples") or []) if b.get("tissueLabel")]
+    directions = [e["direction"] for e in (row.get("effects") or []) if e.get("direction")]
+    return dict(
+        dimension="safety_signal",
+        data_source="ot_safety",
+        source_type="safety_signal",
+        source_record_id=row.get("eventId") or f"safety:{row['event']}",
+        raw_value=None,
+        evidence_score=None,
+        tissue=_scalarize(tissues) if tissues else None,
+        external_id=row.get("url") or None,
+        notes=f"event={row['event']}; direction={_scalarize(directions) or 'unspecified'}; datasource={row.get('datasource')}",
+    )
+
+
+def _build_essentiality_fields(gene_symbol: str, is_essential: bool | None,
+                                prioritisation_value: str | None, depmap_rows: list[dict]) -> dict:
+    """
+    Real Open Targets Target Prioritisation Factor: Gene Essentiality (see
+    open_targets_client.get_essentiality_and_paralogues()'s docstring for
+    the real, confirmed binary -1/0 semantics — NOT continuous like
+    genetic constraint). ONE real row per gene (a single evaluated fact
+    about the gene, not a list of discrete incidents — contrast with
+    _build_safety_signal_fields()'s one-row-per-event pattern below),
+    inserted every time regardless of the real value, so every gene has a
+    real, traceable "checked, here's what OTP/DepMap say" record — not
+    just the essential ones.
+
+    DELIBERATELY NOT SCORED 0-1 (same design question as safety_signal,
+    answered the same way): `evidence_score` is left None on purpose.
+    Registered under its OWN source_type "essentiality_risk" (see
+    app/config.py), never a key in DIMENSION_MATURITY_LADDER, so it can
+    never be silently averaged into evidence_strength/dimension_breakdown
+    or picked as the evidence_maturity rung. Surfaced instead via a
+    dedicated gap type (gap_taxonomy.GAP_TEMPLATES["essentiality_risk"])
+    and a frontend caution flag, same structural mechanism as
+    safety_signal — but kept in a DISTINCT dimension/gap type from it (see
+    app/config.py's COMPARABILITY_FIELDS_BY_SOURCE_TYPE["essentiality_risk"]
+    docstring for why these two are not the same kind of caution).
+
+    CRITICAL REAL NUANCE, stated here at the point of use (not just in the
+    client's docstring), because it directly bears on this project's own
+    real data: SOD1 — an approved drug target via tofersen, a real,
+    marketed antisense-oligonucleotide (ASO) knockdown therapy — is ITSELF
+    flagged essential by OTP/DepMap (`isEssential=True`,
+    `geneEssentiality=-1`; real mean CRISPR-knockout gene-effect across
+    1,258 real DepMap cancer cell line screens: -1.75, strongly essential).
+    This is NOT a contradiction to paper over: DepMap's essentiality call
+    answers "would a COMPLETE CRISPR knockout kill a broad panel of
+    rapidly-PROLIFERATING CANCER cell lines" — a different real question
+    from "is a PARTIAL, tissue-targeted ASO knockdown safe in adult,
+    largely POST-MITOTIC motor neurons in a human being", which is what
+    tofersen actually does and has a real, marketed safety record doing.
+    A high essentiality flag is real, documented caution worth surfacing —
+    it is not, on its own, evidence that a specific real therapeutic
+    modality targeting this gene is unsafe.
+    """
+    all_effects = [
+        s["geneEffect"] for row in (depmap_rows or []) for s in (row.get("screens") or [])
+        if s.get("geneEffect") is not None
+    ]
+    if all_effects:
+        depmap_summary = (
+            f"depmap_screens_n={len(all_effects)}; "
+            f"mean_geneEffect={statistics.mean(all_effects):.4f}; "
+            f"median_geneEffect={statistics.median(all_effects):.4f}"
+        )
+    else:
+        depmap_summary = "no real DepMap screen rows available"
+    return dict(
+        dimension="essentiality_risk",
+        data_source="ot_essentiality",
+        source_type="essentiality_risk",
+        source_record_id=f"ot_essentiality:{gene_symbol}",
+        raw_value=float(prioritisation_value) if prioritisation_value is not None else None,
+        evidence_score=None,
+        notes=(
+            f"isEssential={is_essential}; prioritisation_geneEssentiality={prioritisation_value} "
+            f"(scale: -1=reported essential/unfavorable, 0=not reported essential/favorable); "
+            f"{depmap_summary} (real CRISPR gene-effect across DepMap cancer cell line screens — "
+            f"see this function's docstring: essential-in-proliferating-cancer-lines is a different "
+            f"question from safe-to-knock-down-in-a-specific-human-tissue)"
+        ),
+    )
+
+
+def _build_paralogy_fields(gene_symbol: str, paralog_row: dict) -> dict:
+    """
+    Real Open Targets human paralogue data (Target.homologues, filtered to
+    speciesId="9606" and homologyType != "ortholog_one2one" — see
+    open_targets_client.get_essentiality_and_paralogues()'s docstring for
+    why this filter is the real, correct way to isolate same-species
+    paralogues from cross-species orthologues). ONE real row per real
+    human paralogue found (a gene can have several, or a very different
+    NUMBER of them depending on how broad the shared domain family is —
+    see the real SOD1/FUS/TARDBP comparison in that docstring), same
+    "one row per real distinct fact" pattern as
+    _build_safety_signal_fields() above.
+
+    DELIBERATELY NOT SCORED 0-1, and deliberately NOT forced into a single
+    good/bad direction (this task's own design question): a paralogue is a
+    genuinely two-sided signal — NO real paralogue can mean either "highly
+    specific, low off-target risk" (good) or "no biological backup if
+    something goes wrong" (a different kind of risk); MANY real paralogues
+    at high identity can mean either "off-target risk / functional
+    redundancy that could blunt a knockdown's effect" (bad for modality)
+    or "a validated, druggable protein family with precedent" (arguably
+    good). Because the direction genuinely depends on context this
+    pipeline cannot judge automatically, `evidence_score` is left None,
+    exactly like safety_signal/essentiality_risk — but registered under
+    its own "paralogy" source_type (see app/config.py), NOT lumped in with
+    either of those two, since this is not a risk/caution signal the way
+    they are — it is genuinely descriptive, informational metadata.
+
+    `raw_value` stores the higher of the two real identity-percentage
+    directions OTP reports (queryPercentageIdentity/targetPercentageIdentity
+    aren't symmetric — they measure identity from each gene's own sequence
+    length, so the max of the two is the more conservative "how similar
+    could these two genes' products plausibly be" read), used only for
+    this project's own Modality-gap note-worthiness check (see
+    config.PARALOGUE_MODALITY_NOTE_IDENTITY_THRESHOLD's docstring for why
+    that threshold is deliberately NOT the same as OTP's own official 60%
+    prioritisation-factor cutoff).
+    """
+    max_identity = max(paralog_row["queryPercentageIdentity"], paralog_row["targetPercentageIdentity"])
+    return dict(
+        dimension="paralogy",
+        data_source="ot_paralogy",
+        source_type="paralogy",
+        source_record_id=f"ot_paralogy:{gene_symbol}:{paralog_row['targetGeneSymbol']}",
+        raw_value=round(max_identity, 4),
+        evidence_score=None,
+        external_id=paralog_row.get("targetGeneId"),
+        notes=(
+            f"paralog_gene={paralog_row['targetGeneSymbol']}; "
+            f"query_pct_identity={paralog_row['queryPercentageIdentity']:.2f}; "
+            f"target_pct_identity={paralog_row['targetPercentageIdentity']:.2f}; "
+            f"above_project_note_threshold_{PARALOGUE_MODALITY_NOTE_IDENTITY_THRESHOLD:.0f}pct="
+            f"{'yes' if max_identity >= PARALOGUE_MODALITY_NOTE_IDENTITY_THRESHOLD else 'no'}"
+        ),
+    )
+
+
 _FIELD_BUILDERS = {
     "genetic": _build_genetic_fields,
     "literature": _build_literature_fields,
@@ -370,7 +667,83 @@ def _build_tissue_expression_fields(hpa_data: dict, ensembl_id: str) -> dict:
     )
 
 
-def _build_ppi_network_fields(partners: list[dict], gene_symbol: str) -> dict:
+# Coarse tau-bucket boundaries for the HPA-vs-GTEx agreement check below —
+# reuses HPA's OWN real score tiers (config.TISSUE_SPECIFICITY_SCORES) as
+# the natural cut points, rather than inventing a new threshold set.
+_TAU_HPA_AGREEMENT_BUCKETS = [
+    (0.85, "tissue enriched"),
+    (0.55, "group enriched"),
+    (0.25, "tissue enhanced"),
+    (0.0, "low tissue specificity"),
+]
+
+
+def _tau_to_hpa_like_category(tau: float) -> str:
+    for threshold, category in _TAU_HPA_AGREEMENT_BUCKETS:
+        if tau >= threshold:
+            return category
+    return "low tissue specificity"
+
+
+def _build_gtex_fields(median_by_tissue: dict, gene_symbol: str, hpa_category: str | None) -> dict:
+    """
+    GTEx: real median TPM expression across up to 54 real healthy-donor
+    tissues (see app/ingestion/gtex_client.py). ONE real aggregate row per
+    gene, same reasoning as _build_tissue_expression_fields()/
+    _build_ppi_network_fields() above.
+
+    DESIGN DECISION (this task): stored as dimension="tissue_expression",
+    a SECOND source alongside HPA — not a new "omics" dimension. GTEx
+    measures real healthy-donor expression levels, not disease-vs-healthy
+    differential expression (which is what "omics"/score_omics_expression()
+    actually means here, significance-gated on log2FC + p-value neither of
+    which GTEx provides) — conceptually this is the same underlying
+    question HPA already answers (where is this gene expressed), just
+    from a second, richer real source.
+
+    Cross-checks against HPA's real stated category for the SAME gene
+    (already fetched earlier in ingest_target(), passed in here rather
+    than re-fetched) — a genuinely independent second opinion on tissue
+    specificity. Deliberately NOT routed through
+    contradiction_classifier.py: that classifier's whole design is
+    direction-of-effect-based (does a disease-association CLAIM conflict),
+    and tissue_expression records were already excluded from it on purpose
+    (config.COMPARABILITY_FIELDS_BY_SOURCE_TYPE's "tissue_expression": []
+    — no direction_on_trait concept applies to a gene-level aggregate
+    context signal). "Do two magnitude-based readouts roughly agree" is a
+    different kind of question than "do two claims conflict", so this is
+    a small, honest, direct comparison computed here and recorded in
+    `notes` — a real, coarse check (bucket boundaries reused from HPA's
+    own real score tiers), not a rigorous statistical concordance test,
+    and not a new contradiction-classifier code path.
+    """
+    tau = compute_tau_specificity(median_by_tissue)
+    top_tissues = sorted(median_by_tissue.items(), key=lambda kv: -kv[1])[:3]
+    top_tissues_text = ", ".join(f"{tissue}={median:.1f}TPM" for tissue, median in top_tissues)
+
+    if tau is not None and hpa_category:
+        gtex_bucket = _tau_to_hpa_like_category(tau)
+        agrees = gtex_bucket == hpa_category.strip().lower()
+        agreement_note = (
+            f"GTEx bucket='{gtex_bucket}' vs HPA='{hpa_category}' -> "
+            f"{'AGREE' if agrees else 'DISAGREE'} (real, coarse comparison, not a rigorous concordance test)"
+        )
+    else:
+        agreement_note = "HPA category not available for comparison"
+
+    return dict(
+        dimension="tissue_expression",
+        data_source="gtex",
+        source_type="tissue_expression",
+        source_record_id=f"gtex:{gene_symbol}",
+        raw_value=tau,
+        evidence_score=tau,
+        tissue=top_tissues[0][0] if top_tissues else None,
+        notes=f"tau_specificity={tau}; top_tissues={top_tissues_text}; {agreement_note}",
+    )
+
+
+def _build_ppi_network_fields(partners: list[dict], gene_symbol: str, string_id: str | None = None) -> dict:
     """
     STRING protein-protein interaction network context (see
     app/ingestion/string_client.py docstring). ONE real row per gene, same
@@ -382,6 +755,12 @@ def _build_ppi_network_fields(partners: list[dict], gene_symbol: str) -> dict:
     Real partner names kept in `notes` for traceability (the actual
     per-partner records are not individually persisted, but are not lost
     either — visible in this row's own notes).
+
+    `external_id`: the real STRING-internal protein id (e.g.
+    "9606.ENSP00000270142") resolved via string_client.get_string_id() —
+    previously resolved during ingestion and immediately discarded, now
+    captured for a real, clickable link to this gene's STRING network
+    page (see app/core/presentation/source_links.py).
     """
     partner_count = len(partners)
     partner_names = [p["preferredName_B"] for p in partners]
@@ -392,6 +771,7 @@ def _build_ppi_network_fields(partners: list[dict], gene_symbol: str) -> dict:
         source_record_id=f"string:{gene_symbol}",
         raw_value=float(partner_count),
         evidence_score=score_ppi_hub(partner_count),
+        external_id=string_id,
         notes=f"high_confidence_partner_count={partner_count}; partners={', '.join(partner_names) or 'none'}",
     )
 
@@ -520,6 +900,102 @@ def ingest_target(db, gene_symbol: str, ensembl_id: str) -> int:
             saved += 1
     print(f"  [{gene_symbol}] chembl_drug_target: {len(drug_target_rows)} rows ingested")
 
+    # Real Open Targets Target Prioritisation Factors: Known Safety Events
+    # and Genetic Constraint (see
+    # open_targets_client.get_prioritisation_and_safety()'s docstring for
+    # the full real field semantics — both gene-level, disease-agnostic
+    # Target annotations, same "not from evidences()" pattern as
+    # pathway/drug_target above).
+    try:
+        prioritisation_data = get_prioritisation_and_safety(ensembl_id)
+    except Exception as exc:
+        print(f"  [{gene_symbol}] ot_prioritisation: query failed ({exc}), skipping")
+        prioritisation_data = None
+
+    if prioritisation_data is not None:
+        constraint_record = EvidenceRecord(
+            target_id=target.id,
+            **_build_genetic_constraint_fields(
+                gene_symbol,
+                prioritisation_data["genetic_constraint_prioritisation"],
+                prioritisation_data["genetic_constraint_rows"],
+            ),
+        )
+        if _save_evidence(db, constraint_record, gene_symbol, "ot_genetic_constraint"):
+            saved += 1
+        print(f"  [{gene_symbol}] ot_genetic_constraint: 1 row ingested "
+              f"(prioritisation_value={prioritisation_data['genetic_constraint_prioritisation']})")
+
+        safety_rows = prioritisation_data["safety_liabilities"]
+        safety_saved = 0
+        for row in safety_rows:
+            safety_record = EvidenceRecord(target_id=target.id, **_build_safety_signal_fields(row))
+            if _save_evidence(db, safety_record, gene_symbol, "ot_safety"):
+                safety_saved += 1
+                saved += 1
+        print(f"  [{gene_symbol}] ot_safety: {safety_saved} row(s) ingested "
+              f"({len(safety_rows)} real documented safety event(s) found)")
+    else:
+        print(f"  [{gene_symbol}] ot_genetic_constraint: 0 rows ingested (query failed)")
+        print(f"  [{gene_symbol}] ot_safety: 0 rows ingested (query failed)")
+
+    # Two more real Open Targets Target Prioritisation Factors: Gene
+    # Essentiality and Paralogues (see
+    # open_targets_client.get_essentiality_and_paralogues()'s docstring for
+    # the full real field semantics). Same "not from evidences()" pattern
+    # as pathway/drug_target/genetic_constraint/safety above.
+    try:
+        essentiality_data = get_essentiality_and_paralogues(ensembl_id)
+    except Exception as exc:
+        print(f"  [{gene_symbol}] ot_essentiality/ot_paralogy: query failed ({exc}), skipping")
+        essentiality_data = None
+
+    if essentiality_data is not None:
+        essentiality_record = EvidenceRecord(
+            target_id=target.id,
+            **_build_essentiality_fields(
+                gene_symbol,
+                essentiality_data["is_essential"],
+                essentiality_data["gene_essentiality_prioritisation"],
+                essentiality_data["depmap_essentiality_rows"],
+            ),
+        )
+        if _save_evidence(db, essentiality_record, gene_symbol, "ot_essentiality"):
+            saved += 1
+        print(f"  [{gene_symbol}] ot_essentiality: 1 row ingested "
+              f"(isEssential={essentiality_data['is_essential']})")
+
+        paralog_rows = essentiality_data["human_paralogues"]
+        paralog_saved = 0
+        for row in paralog_rows:
+            paralog_record = EvidenceRecord(target_id=target.id, **_build_paralogy_fields(gene_symbol, row))
+            if _save_evidence(db, paralog_record, gene_symbol, "ot_paralogy"):
+                paralog_saved += 1
+                saved += 1
+        print(f"  [{gene_symbol}] ot_paralogy: {paralog_saved} row(s) ingested "
+              f"({len(paralog_rows)} real human paralogue(s) found)")
+    else:
+        print(f"  [{gene_symbol}] ot_essentiality: 0 rows ingested (query failed)")
+        print(f"  [{gene_symbol}] ot_paralogy: 0 rows ingested (query failed)")
+
+    # ClinicalTrials.gov: a second, independent human_clinical source (see
+    # app/ingestion/clinicaltrials_gov_client.py's module docstring) —
+    # recovers real trials OTP's own clinical_precedence datasource misses
+    # entirely for some genes (confirmed: BIIB078/WVE-004 for C9orf72).
+    try:
+        ctgov_rows = get_clinical_trials(gene_symbol, DISEASE_NAME)
+    except Exception as exc:
+        print(f"  [{gene_symbol}] clinicaltrials_gov: query failed ({exc}), skipping")
+        ctgov_rows = []
+    for row in ctgov_rows:
+        record = EvidenceRecord(
+            target_id=target.id, dimension="human_clinical", data_source="clinicaltrials_gov",
+            **_build_ctgov_clinical_fields(row),
+        )
+        if _save_evidence(db, record, gene_symbol, "clinicaltrials_gov"):
+            saved += 1
+    print(f"  [{gene_symbol}] clinicaltrials_gov: {len(ctgov_rows)} rows ingested")
+
     # Tissue Expression: real Human Protein Atlas data — a genuinely
     # independent external source (not Open Targets, see
     # app/ingestion/hpa_client.py docstring), handled gracefully like every
@@ -537,6 +1013,28 @@ def ingest_target(db, gene_symbol: str, ensembl_id: str) -> int:
     else:
         print(f"  [{gene_symbol}] hpa: 0 rows ingested (no real HPA record for this gene)")
 
+    # GTEx: real median expression across real healthy-donor tissues — a
+    # second, independent tissue_expression source alongside HPA (see
+    # app/ingestion/gtex_client.py's module docstring for why this isn't
+    # a new "omics" dimension). Cross-checked against HPA's own real
+    # category above (hpa_data may be None if HPA itself failed/had no
+    # record — handled honestly, no cross-check attempted in that case).
+    try:
+        gtex_median_by_tissue = get_median_tissue_expression(gene_symbol)
+    except Exception as exc:
+        print(f"  [{gene_symbol}] gtex: query failed ({exc}), skipping")
+        gtex_median_by_tissue = None
+    if gtex_median_by_tissue:
+        hpa_category = hpa_data.get("rna_tissue_specificity") if hpa_data else None
+        record = EvidenceRecord(
+            target_id=target.id, **_build_gtex_fields(gtex_median_by_tissue, gene_symbol, hpa_category),
+        )
+        if _save_evidence(db, record, gene_symbol, "gtex"):
+            saved += 1
+            print(f"  [{gene_symbol}] gtex: 1 row ingested ({len(gtex_median_by_tissue)} real tissues)")
+    else:
+        print(f"  [{gene_symbol}] gtex: 0 rows ingested (no real GTEx record for this gene)")
+
     # PPI Network: real STRING high-confidence interaction partners —
     # another genuinely independent external source, same graceful
     # error-handling convention. IMPORTANT: a real query failure (network/
@@ -551,7 +1049,12 @@ def ingest_target(db, gene_symbol: str, ensembl_id: str) -> int:
         print(f"  [{gene_symbol}] string: query failed ({exc}), skipping")
         ppi_partners = None
     if ppi_partners is not None:
-        record = EvidenceRecord(target_id=target.id, **_build_ppi_network_fields(ppi_partners, gene_symbol))
+        try:
+            string_id = get_string_id(gene_symbol)
+        except Exception as exc:
+            print(f"  [{gene_symbol}] string: id-resolution for source link failed ({exc}), link will be unavailable")
+            string_id = None
+        record = EvidenceRecord(target_id=target.id, **_build_ppi_network_fields(ppi_partners, gene_symbol, string_id))
         if _save_evidence(db, record, gene_symbol, "string"):
             saved += 1
             print(f"  [{gene_symbol}] string: 1 row ingested ({len(ppi_partners)} real high-confidence partners)")
@@ -559,16 +1062,69 @@ def ingest_target(db, gene_symbol: str, ensembl_id: str) -> int:
     return saved
 
 
+def clear_evidence_and_downstream_analysis(db) -> dict:
+    """
+    Clear EvidenceRecord AND every table whose rows are a conclusion
+    computed FROM evidence — ContradictionLog, GapRecord, PriorityScore,
+    PipelineRunLog — together, atomically, before a fresh re-ingestion.
+
+    Real bug this fixes (found while cleaning up an orphaned NEK1
+    ContradictionLog row during Matrix testing): EvidenceRecord's primary
+    key is a global auto-increment, NOT scoped per gene. The previous
+    "clear before re-insert" behavior deleted only EvidenceRecord and left
+    ContradictionLog/GapRecord/PriorityScore rows in place, pointing at the
+    OLD evidence_record ids. On the next full re-ingestion, those same
+    numeric ids get reused for a DIFFERENT gene's new rows — so a stale
+    ContradictionLog row doesn't just go orphaned (referencing nothing), it
+    silently starts resolving to a different gene's real evidence. That is
+    a confident, plausible, WRONG answer, not a missing one — worse than an
+    empty result. The same "conclusion computed from now-replaced data"
+    logic applies to GapRecord (rationale/investigation_suggestion quote
+    specific evidence values) and PriorityScore (dimension_breakdown is
+    literally a snapshot of evidence that may no longer exist in that
+    form). PipelineRunLog is cleared too so GET /contradictions and
+    GET /gaps correctly report "never (re-)checked since this evidence was
+    ingested" instead of a false "checked, clean" carried over from before
+    the re-ingestion — see PipelineRunLog's own docstring in
+    app/db/models.py for why that "checked vs. never-checked" distinction
+    exists at all.
+
+    Deletion order: dependents (ContradictionLog/GapRecord/PriorityScore/
+    PipelineRunLog) before EvidenceRecord itself — matters for readability/
+    intent even though SQLite doesn't enforce FK constraints by default
+    here, so an interrupted run never leaves EvidenceRecord gone while a
+    dependent row still references it.
+    """
+    counts = {
+        "contradiction_log": db.query(ContradictionLog).delete(),
+        "gap_records": db.query(GapRecord).delete(),
+        "priority_scores": db.query(PriorityScore).delete(),
+        "pipeline_run_log": db.query(PipelineRunLog).delete(),
+        "evidence_records": db.query(EvidenceRecord).delete(),
+    }
+    if any(counts.values()):
+        db.commit()
+    return counts
+
+
 def main():
     init_db()
     db = SessionLocal()
     try:
-        # Prototype re-run behavior: clear prior ingestion rather than
-        # accumulating duplicates on every run.
-        deleted = db.query(EvidenceRecord).delete()
-        if deleted:
-            db.commit()
-            print(f"Cleared {deleted} existing evidence records before re-ingesting.\n")
+        # Prototype re-run behavior: clear prior ingestion AND every
+        # downstream analysis table computed from it rather than
+        # accumulating duplicates or leaving stale/mismatched references
+        # behind — see clear_evidence_and_downstream_analysis()'s docstring
+        # for the real cross-gene ID-reuse bug this prevents.
+        counts = clear_evidence_and_downstream_analysis(db)
+        if any(counts.values()):
+            print(
+                f"Cleared before re-ingesting: {counts['evidence_records']} evidence record(s), "
+                f"{counts['contradiction_log']} contradiction log row(s), "
+                f"{counts['gap_records']} gap record(s), "
+                f"{counts['priority_scores']} priority score(s), "
+                f"{counts['pipeline_run_log']} pipeline run log row(s).\n"
+            )
 
         grand_total = 0
         for gene_symbol, ensembl_id in CANDIDATE_TARGETS.items():

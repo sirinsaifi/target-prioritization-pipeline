@@ -1,4 +1,5 @@
 import type { Target, GapType } from './data'
+import { consistencyTier, maturityTier, priorityTier, pickMainGap, type ScoreTier } from './api'
 
 /* ─── Portfolio Comparison — side-by-side view of all candidate targets,
    so a stakeholder can compare WHY each ranks where it does at a glance,
@@ -46,6 +47,36 @@ const GAP_TYPE_SHORT: Record<GapType, string> = {
   'Validation Gap': 'validation',
   'Population Gap': 'population',
   'Evidence-Consistency Gap': 'consistency',
+  'Safety Signal Gap': 'safety signal',
+  'Essentiality Risk Gap': 'essentiality risk',
+}
+
+/* High/Medium/Low chip styling — same visual language (green/amber/red)
+ * as this file's own GREEN/AMBER/GRAY score-cell colors above, applied to
+ * the tiers computed in api.ts (which reuse the SAME thresholds as
+ * "Why This Target?", not a new scale invented for this table). */
+/* Translational Opportunity cell colors — SAME categories/colors as
+ * TargetDetail.tsx's/TargetReport.tsx's own opportunityStyle()/
+ * opportunityChipStyle() (kept as a small local duplicate, matching this
+ * file's existing convention — see GAP_TYPE_SHORT/tierChipStyle above).
+ * "De-risking Needed" reuses the caution-flag red deliberately — it must
+ * never read as more positive than an actual caution flag. */
+function opportunityCellStyle(category: string) {
+  switch (category) {
+    case 'De-risking Needed':           return { bg: '#fef2f2', color: '#991b1b', border: '#fecaca' }
+    case 'Clinical-Stage':              return GREEN
+    case 'Preclinical High-Confidence': return AMBER
+    default:                            return GRAY  // Early-Stage Discovery
+  }
+}
+
+function tierChipStyle(tier: ScoreTier) {
+  switch (tier) {
+    case 'High':   return GREEN
+    case 'Medium': return AMBER
+    case 'Low':    return { bg: '#fef2f2', color: '#991b1b', border: '#fecaca' }
+    default:       return MUTED
+  }
 }
 
 interface Props {
@@ -53,13 +84,18 @@ interface Props {
   onSelectTarget: (t: Target) => void
 }
 
-/* Real dimension labels, in the same order api.ts uses when it builds
-   Target.dimensions — plus the four supplementary dimensions that aren't
-   in that array but ARE real, per-gene evidence (see data.ts::Target and
-   the app's real MVP_DIMENSIONS in app/config.py). Displayed here as
-   separate rows because the whole point of this view is comparing WHY
-   each target sits where it does, dimension by real dimension. */
-const CORE_DIMENSIONS = ['Genetic', 'Literature', 'Pathway', 'Human / Clinical'] as const
+/* Real dimension labels, in the SAME order api.ts's DIMENSION_ORDER uses
+ * when it builds Target.dimensions — all 9 real MVP dimensions (see
+ * app/config.py's MVP_DIMENSIONS), not just the original 4. Target
+ * De-risking Report audit finding: this table was stuck at 4 dimensions
+ * only because CORE_DIMENSIONS was never updated after 5 more real
+ * dimensions were added to the backend in later work — Target.dimensions
+ * itself already carries all 9 (fixed in api.ts as part of this task), so
+ * extending this list is the only change needed here too. */
+const CORE_DIMENSIONS = [
+  'Genetic', 'Literature', 'Pathway', 'Human / Clinical',
+  'Omics', 'Experimental', 'Drug-Target', 'Tissue Expression', 'PPI Network',
+] as const
 
 export default function PortfolioComparison({ targets, onSelectTarget }: Props) {
   // Default sort: descending by priority score (highest-priority left-most)
@@ -110,18 +146,64 @@ export default function PortfolioComparison({ targets, onSelectTarget }: Props) 
           </thead>
 
           <tbody>
-            {/* Priority Score */}
+            {/* Priority Score — real 0-100 composite PLUS a High/Medium/Low
+                label. Tiered against the REAL, unrounded priorityScoreRaw
+                (a prior bug compared the already-rounded display integer
+                instead), using priority's OWN thresholds — 0.7/0.5,
+                reusing config.EVIDENCE_STRENGTH_HIGH_THRESHOLD/
+                EVIDENCE_CONSISTENCY_GAP_THRESHOLD, deliberately NOT the
+                same 0.8/0.5 pair confidenceTier() uses, since priority_score
+                is a different composite metric — see api.ts::priorityTier()
+                for the full reasoning. */}
             <tr>
               <td style={rowLabelStyle}>
-                <div style={{ fontWeight: 600 }}>Priority Score</div>
+                <div style={{ fontWeight: 600 }}>Priority</div>
                 <div style={sublabelStyle}>0-100 composite</div>
               </td>
               {sorted.map(t => {
                 const s = scoreCellStyle(t.priorityScore, t.scoreComputed)
+                const tier = priorityTier(t.priorityScoreRaw, t.scoreComputed)
+                const tierStyle = tierChipStyle(tier)
                 return (
                   <td key={t.gene} style={{ ...cellStyle, background: s.bg, color: s.color, borderColor: s.border }}>
                     <div style={{ fontVariantNumeric: 'tabular-nums', fontWeight: 700, fontSize: 15 }}>
                       {t.scoreComputed ? t.priorityScore : '—'}
+                    </div>
+                    <span style={{
+                      display: 'inline-block', marginTop: 4, fontSize: 9.5, fontWeight: 700,
+                      letterSpacing: '0.04em', padding: '1px 6px', borderRadius: 4,
+                      background: tierStyle.bg, color: tierStyle.color, border: `1px solid ${tierStyle.border}`,
+                    }}>
+                      {tier.toUpperCase()}
+                    </span>
+                  </td>
+                )
+              })}
+            </tr>
+
+            {/* Section header — Translational Opportunity (prototype) */}
+            {/* Deliberately its OWN section, separated from the Priority
+                row above by a header boundary — a DETERMINISTIC, rule-based
+                category, explicitly NOT a score, and never to be read as
+                part of Priority (see app/core/classification/
+                translational_opportunity.py's module docstring). A real
+                caution flag always forces "De-risking Needed" here,
+                regardless of how strong Priority above looks for the same
+                gene (see SOD1/TARDBP below — both HIGH priority, both
+                De-risking Needed). */}
+            <SectionHeader label="Translational Opportunity — prototype, not a validated score" colSpan={sorted.length + 1} />
+            <tr>
+              <td style={rowLabelStyle}>
+                <div style={{ fontWeight: 600 }}>Category</div>
+                <div style={sublabelStyle}>rule-based, deterministic</div>
+              </td>
+              {sorted.map(t => {
+                const opp = t.translationalOpportunity
+                const style = opp ? opportunityCellStyle(opp.category) : MUTED
+                return (
+                  <td key={t.gene} style={{ ...cellStyle, background: style.bg, color: style.color, borderColor: style.border }}>
+                    <div style={{ fontWeight: 700, fontSize: 11.5, lineHeight: 1.3 }}>
+                      {opp ? opp.category : '—'}
                     </div>
                   </td>
                 )
@@ -131,15 +213,13 @@ export default function PortfolioComparison({ targets, onSelectTarget }: Props) 
             {/* Section header — Evidence Profile */}
             <SectionHeader label="Evidence Profile" colSpan={sorted.length + 1} />
 
-            {/* Strength / Consistency / Maturity — pulled from Target's
-                own dimensions array, which api.ts builds from real
-                PriorityScore.dimension_breakdown; the composite
-                strength/consistency/maturity numbers themselves are NOT
-                currently exposed by fetchTargetSummaries() (see api.ts —
-                only the dimension_breakdown gets scaled to 0-100 there),
-                so this table shows the per-dimension breakdown that IS
-                available rather than fabricating aggregate numbers that
-                haven't been fetched. */}
+            {/* Per-dimension scores — pulled from Target's own dimensions
+                array (api.ts's DIMENSION_ORDER, all 9 real MVP
+                dimensions — extended from 4 as part of this task, see
+                CORE_DIMENSIONS's own comment above). `present` now reads
+                the real, authoritative DimensionScore.present flag (this
+                task) rather than a `score > 0` heuristic, which would
+                have misread a genuine real 0.0 score as "no data". */}
             {CORE_DIMENSIONS.map((label, i) => (
               <tr key={label}>
                 <td style={rowLabelStyle}>
@@ -148,19 +228,63 @@ export default function PortfolioComparison({ targets, onSelectTarget }: Props) 
                 </td>
                 {sorted.map(t => {
                   const d = t.dimensions[i]
-                  const present = t.scoreComputed && d.score > 0
+                  const present = t.scoreComputed && d.present
                   const s = scoreCellStyle(d.score, present)
                   return (
                     <td key={t.gene} style={{ ...cellStyle, background: s.bg, color: s.color, borderColor: s.border }}>
                       <div style={{ fontVariantNumeric: 'tabular-nums', fontWeight: 600 }}>
                         {present ? d.score : '—'}
                       </div>
-                      <div style={{ fontSize: 10, marginTop: 2, opacity: 0.75 }}>{d.level}</div>
+                      <div style={{ fontSize: 10, marginTop: 2, opacity: 0.75 }}>{present ? d.level : 'no data'}</div>
                     </td>
                   )
                 })}
               </tr>
             ))}
+
+            {/* Consistency / Maturity (this task) — real evidence_consistency/
+                evidence_maturity, previously fetched then silently discarded
+                (see data.ts's Target.evidenceConsistency/.evidenceMaturity
+                docstring), now shown as High/Medium/Low using the SAME
+                thresholds "Why This Target?" already established
+                (api.ts::consistencyTier()/maturityTier()). */}
+            <tr>
+              <td style={rowLabelStyle}>
+                <div style={{ fontWeight: 600 }}>Consistency</div>
+                <div style={sublabelStyle}>agreement across sources</div>
+              </td>
+              {sorted.map(t => {
+                const tier = consistencyTier(t.evidenceConsistency)
+                const s = tierChipStyle(tier)
+                return (
+                  <td key={t.gene} style={{ ...cellStyle, background: s.bg, color: s.color, borderColor: s.border }}>
+                    <div style={{ fontWeight: 700, fontSize: 13 }}>{tier.toUpperCase()}</div>
+                    {t.evidenceConsistency !== null && (
+                      <div style={{ fontSize: 10, marginTop: 2, opacity: 0.75 }}>{t.evidenceConsistency.toFixed(2)}</div>
+                    )}
+                  </td>
+                )
+              })}
+            </tr>
+
+            <tr>
+              <td style={rowLabelStyle}>
+                <div style={{ fontWeight: 600 }}>Maturity</div>
+                <div style={sublabelStyle}>translational stage reached</div>
+              </td>
+              {sorted.map(t => {
+                const tier = maturityTier(t.evidenceMaturity)
+                const s = tierChipStyle(tier)
+                return (
+                  <td key={t.gene} style={{ ...cellStyle, background: s.bg, color: s.color, borderColor: s.border }}>
+                    <div style={{ fontWeight: 700, fontSize: 13 }}>{tier.toUpperCase()}</div>
+                    {t.evidenceMaturity !== null && (
+                      <div style={{ fontSize: 10, marginTop: 2, opacity: 0.75 }}>{t.evidenceMaturity.toFixed(2)}</div>
+                    )}
+                  </td>
+                )
+              })}
+            </tr>
 
             {/* Section header — Momentum */}
             <SectionHeader label="Evidence Momentum" colSpan={sorted.length + 1} />
@@ -207,6 +331,32 @@ export default function PortfolioComparison({ targets, onSelectTarget }: Props) 
                     </div>
                     <div style={{ fontSize: 10, marginTop: 2, opacity: 0.75 }}>
                       {t.contradictionsChecked ? (has ? 'detected' : 'none found') : 'not checked'}
+                    </div>
+                  </td>
+                )
+              })}
+            </tr>
+
+            {/* Main Gap (this task) — the single most significant real
+                open gap per target, by a documented priority order (see
+                api.ts::pickMainGap()'s own docstring: Safety Signal >
+                Essentiality Risk > Validation > Modality > Mechanistic >
+                Population > Evidence-Consistency — this project's own
+                judgment call, not an external standard). Distinct from
+                the full "Research Gaps" row below, which still lists
+                EVERY real gap type found, not just the headline one. */}
+            <tr>
+              <td style={rowLabelStyle}>
+                <div style={{ fontWeight: 600 }}>Main Gap</div>
+                <div style={sublabelStyle}>single most significant</div>
+              </td>
+              {sorted.map(t => {
+                const main = pickMainGap(t.gaps)
+                const style = !t.gapsChecked ? MUTED : main ? AMBER : GREEN
+                return (
+                  <td key={t.gene} style={{ ...cellStyle, background: style.bg, color: style.color, borderColor: style.border }}>
+                    <div style={{ fontWeight: 700, fontSize: 12 }}>
+                      {!t.gapsChecked ? '—' : main ? (GAP_TYPE_SHORT[main.type] || main.type) : 'None'}
                     </div>
                   </td>
                 )

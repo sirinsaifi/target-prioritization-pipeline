@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
 from app.db.database import init_db
-from app.api.routes import targets, evidence, scoring, contradictions, gaps, narrative, narration, agent, momentum
+from app.api.routes import targets, evidence, scoring, contradictions, gaps, narrative, narration, agent, momentum, graph
 from app.config import DISEASE_NAME, DISEASE_EFO_ID
 
 
@@ -51,6 +51,7 @@ app.include_router(narrative.router)
 app.include_router(narration.router)
 app.include_router(agent.router)
 app.include_router(momentum.router)
+app.include_router(graph.router)
 
 
 @app.get("/")

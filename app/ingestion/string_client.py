@@ -28,12 +28,16 @@ STRING_BASE_URL = "https://string-db.org/api"
 STRING_SPECIES_HUMAN = 9606
 
 
-def get_ppi_partners(gene_symbol: str, required_score: int = 700) -> list[dict]:
+def get_string_id(gene_symbol: str) -> str | None:
     """
-    Fetch real high-confidence STRING interaction partners for a gene.
-    Returns an empty list if STRING has no real mapping for this gene
-    symbol (real absence, not an error) — the ID-resolution step returning
-    zero hits is itself a valid, real outcome.
+    Resolve a gene symbol to its real STRING-internal protein identifier
+    (e.g. "9606.ENSP00000270142") — the ID-resolution step
+    get_ppi_partners() already does internally, factored out here so a
+    caller that needs the real id ITSELF (not just the partner list) —
+    e.g. scripts/ingest_evidence.py, capturing it for a real, clickable
+    STRING source link — doesn't have to reimplement this lookup. Returns
+    None if STRING has no real mapping for this gene symbol (a real
+    absence, not an error), same convention as get_ppi_partners().
     """
     id_response = requests.get(
         f"{STRING_BASE_URL}/json/get_string_ids",
@@ -42,9 +46,19 @@ def get_ppi_partners(gene_symbol: str, required_score: int = 700) -> list[dict]:
     )
     id_response.raise_for_status()
     id_matches = id_response.json()
-    if not id_matches:
+    return id_matches[0]["stringId"] if id_matches else None
+
+
+def get_ppi_partners(gene_symbol: str, required_score: int = 700) -> list[dict]:
+    """
+    Fetch real high-confidence STRING interaction partners for a gene.
+    Returns an empty list if STRING has no real mapping for this gene
+    symbol (real absence, not an error) — the ID-resolution step returning
+    zero hits is itself a valid, real outcome.
+    """
+    string_id = get_string_id(gene_symbol)
+    if string_id is None:
         return []
-    string_id = id_matches[0]["stringId"]
 
     partners_response = requests.get(
         f"{STRING_BASE_URL}/json/interaction_partners",

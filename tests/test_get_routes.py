@@ -220,7 +220,96 @@ def test_get_gaps_reflects_real_persisted_gaps_without_recomputing(client_with_t
     assert [g["gap_type"] for g in read_result["gaps"]] == [g["gap_type"] for g in run_result["gaps"]]
 
 
+def test_get_gaps_run_surfaces_a_real_safety_signal_gap(client_with_test_db):
+    # Real data has never triggered this path (all 5 real ALS genes show
+    # zero documented safety events — see CLAUDE.md) — constructed here,
+    # same pattern as other real-but-unexercised branches in this codebase.
+    client, SessionLocal = client_with_test_db
+    target_id = _seed_target_with_no_real_gaps(SessionLocal)
+
+    db = SessionLocal()
+    from app.db.models import EvidenceRecord
+    db.add(EvidenceRecord(
+        target_id=target_id, dimension="safety_signal", data_source="ot_safety",
+        source_type="safety_signal", source_record_id="HP_0001657",
+        evidence_score=None, notes="event=prolongation of QT interval of ECG; direction=Inhibition; datasource=Bowes et al. (2012)",
+    ))
+    db.commit()
+    db.close()
+
+    client.post(f"/contradictions/target/{target_id}/run")
+    client.post(f"/scoring/target/{target_id}/compute")
+    result = client.post(f"/gaps/target/{target_id}/run").json()
+
+    gap_types = [g["gap_type"] for g in result["gaps"]]
+    assert "safety_signal" in gap_types
+    safety_gap = next(g for g in result["gaps"] if g["gap_type"] == "safety_signal")
+    assert "prolongation of QT interval of ECG" in safety_gap["rationale"]
+    assert "does not automatically disqualify" in safety_gap["investigation_suggestion"]
+
+
+def test_get_gaps_run_surfaces_a_real_essentiality_risk_gap(client_with_test_db):
+    # Constructed (KCNH2-shaped), same pattern as the safety_signal test
+    # above — real ALS data has SOD1/TARDBP flagged essential, but neither
+    # currently also satisfies the strength_high_threshold gate combined
+    # with a fresh, isolated fixture the way this test needs.
+    client, SessionLocal = client_with_test_db
+    target_id = _seed_target_with_no_real_gaps(SessionLocal)
+
+    db = SessionLocal()
+    from app.db.models import EvidenceRecord
+    db.add(EvidenceRecord(
+        target_id=target_id, dimension="essentiality_risk", data_source="ot_essentiality",
+        source_type="essentiality_risk", source_record_id="ot_essentiality:KCNH2",
+        raw_value=-1.0, evidence_score=None,
+        notes="isEssential=True; prioritisation_geneEssentiality=-1; depmap_screens_n=1258; mean_geneEffect=-1.5000",
+    ))
+    db.commit()
+    db.close()
+
+    client.post(f"/contradictions/target/{target_id}/run")
+    client.post(f"/scoring/target/{target_id}/compute")
+    result = client.post(f"/gaps/target/{target_id}/run").json()
+
+    gap_types = [g["gap_type"] for g in result["gaps"]]
+    assert "essentiality_risk" in gap_types
+    finding = next(g for g in result["gaps"] if g["gap_type"] == "essentiality_risk")
+    assert "isEssential=True" in finding["rationale"]
+    assert "tofersen" in finding["investigation_suggestion"]
+
+
 def test_get_gaps_404s_for_unknown_target(client_with_test_db):
     client, _ = client_with_test_db
     resp = client.get("/gaps/target/999")
     assert resp.status_code == 404
+
+
+# --- GET /graph/target/{id} ---
+
+def test_get_graph_404s_for_unknown_target(client_with_test_db):
+    client, _ = client_with_test_db
+    resp = client.get("/graph/target/999")
+    assert resp.status_code == 404
+
+
+def test_get_graph_returns_real_nodes_and_edges_without_recomputing_anything(client_with_test_db):
+    client, SessionLocal = client_with_test_db
+    target_id = _seed_target_with_genetic_evidence(SessionLocal)
+
+    resp = client.get(f"/graph/target/{target_id}")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "nodes" in body and "edges" in body
+
+    node_types = {n["type"] for n in body["nodes"]}
+    # Target + disease nodes always exist; this fixture has no pathway/PPI/
+    # gap/contradiction rows, so those node types are correctly absent.
+    assert node_types == {"target", "disease"}
+    edge_types = {e["type"] for e in body["edges"]}
+    assert edge_types == {"associated_with_disease"}
+
+    # Confirm no scoring/contradiction/gap side effects — this route is
+    # read-only (see graph.py's docstring).
+    assert client.get(f"/scoring/target/{target_id}").status_code == 404
+    assert client.get(f"/contradictions/target/{target_id}").status_code == 404
+    assert client.get(f"/gaps/target/{target_id}").status_code == 404

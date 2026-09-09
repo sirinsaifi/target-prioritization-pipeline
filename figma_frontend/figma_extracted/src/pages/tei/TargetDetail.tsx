@@ -1,6 +1,8 @@
 import { useState, useEffect } from 'react'
-import type { Target, DimensionScore, Contradiction, ResearchGap, EvidenceItem, ContraType, GapType, Momentum, MomentumTrend } from './data'
+import type { Target, DimensionScore, Contradiction, ResearchGap, EvidenceItem, ContraType, GapType, Momentum, MomentumTrend, CautionFlag } from './data'
 import { fetchTargetDetail, runFullAnalysis } from './api'
+import EvidenceNetwork from './EvidenceNetwork'
+import TargetReport from './TargetReport'
 
 /* ─── Mini helpers ─────────────────────────────────────────────────────────── */
 
@@ -39,6 +41,29 @@ function gapStyle(type: GapType) {
     case 'Modality Gap':            return { bg: 'var(--gap-modality-bg)',   color: 'var(--gap-modality)'   }
     case 'Mechanistic Gap':         return { bg: 'var(--gap-mechanistic-bg)',color: 'var(--gap-mechanistic)' }
     case 'Evidence-Consistency Gap':return { bg: 'var(--gap-consistency-bg)',color: 'var(--gap-consistency)' }
+    // Real gap types that fire because a real fact EXISTS (a safety event
+    // or essentiality flag), not because evidence is missing — reuse the
+    // same caution-banner design tokens (var(--status-crit*)) for visual
+    // consistency with that risk-flag character, rather than inventing a
+    // 6th/7th distinct gap color.
+    case 'Safety Signal Gap':       return { bg: 'var(--status-crit-bg)',    color: 'var(--status-crit)'     }
+    case 'Essentiality Risk Gap':   return { bg: 'var(--status-crit-bg)',    color: 'var(--status-crit)'     }
+  }
+}
+
+/* Translational Opportunity (decision-layer strategy) — a DETERMINISTIC,
+ * rule-based category, explicitly NOT a score (see
+ * app/core/classification/translational_opportunity.py's module
+ * docstring). "De-risking Needed" reuses the same caution-flag red — it's
+ * the category a real safety_signal/essentiality_risk flag ALWAYS forces,
+ * regardless of how strong everything else looks, so its color must never
+ * read as more positive than the caution banner itself. */
+function opportunityStyle(category: string) {
+  switch (category) {
+    case 'De-risking Needed':          return { bg: 'var(--status-crit-bg)', color: 'var(--status-crit)' }
+    case 'Clinical-Stage':             return { bg: 'var(--status-good-bg)', color: '#065f46' }
+    case 'Preclinical High-Confidence':return { bg: 'var(--status-warn-bg)', color: '#92400e' }
+    default:                           return { bg: 'var(--status-neutral-bg)', color: '#374151' }  // Early-Stage Discovery
   }
 }
 
@@ -243,9 +268,27 @@ function EvidenceTab({ items }: { items: EvidenceItem[] }) {
                 )}
               </div>
             </div>
-            <div style={{ flexShrink: 0, fontSize: 11, color: 'var(--seq-450)', fontWeight: 600 }}>
-              {item.source}
-            </div>
+            {item.sourceUrl ? (
+              <a
+                href={item.sourceUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                title={`Open the real ${item.source} record for ${item.id}`}
+                style={{
+                  flexShrink: 0, fontSize: 11, color: 'var(--seq-450)', fontWeight: 600,
+                  textDecoration: 'none', display: 'flex', alignItems: 'center', gap: 3,
+                }}
+                onMouseEnter={e => (e.currentTarget.style.textDecoration = 'underline')}
+                onMouseLeave={e => (e.currentTarget.style.textDecoration = 'none')}
+              >
+                {item.source}
+                <span aria-hidden="true" style={{ fontSize: 10 }}>↗</span>
+              </a>
+            ) : (
+              <div style={{ flexShrink: 0, fontSize: 11, color: 'var(--seq-450)', fontWeight: 600 }}>
+                {item.source}
+              </div>
+            )}
           </div>
         </div>
       ))}
@@ -374,24 +417,49 @@ function ContradictionsTab({ items, checked }: { items: Contradiction[]; checked
 
 /* ─── Research Gaps tab ────────────────────────────────────────────────────── */
 
-function GapCard({ g }: { g: ResearchGap }) {
+/* A gap as a complete, 5-part decision unit (decision-layer strategy
+ * priority #2) — Gap Type -> Evidence -> Why it matters -> Next
+ * investigation -> Decision impact. Every part below is real and
+ * TEMPLATED on the backend (see app/core/gaps/gap_taxonomy.py's
+ * WHY_IT_MATTERS/DECISION_IMPACT dicts) — this component only lays them
+ * out, it never generates or rephrases any of the text. Rendered as a
+ * labeled, visually separated decision brief rather than a wall of text,
+ * per this feature's own design goal. */
+function GapSection({ label, labelColor, children }: { label: string; labelColor: string; children: string }) {
+  return (
+    <div style={{ marginBottom: 10 }}>
+      <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.06em', textTransform: 'uppercase', color: labelColor, marginBottom: 3 }}>
+        {label}
+      </div>
+      <div style={{ fontSize: 12.5, lineHeight: 1.55, color: 'var(--ink-1)' }}>{children}</div>
+    </div>
+  )
+}
+
+// Exported (this task) so the Evidence + Risk + Gap Matrix's Gap-column
+// drill-down drawer can reuse this EXACT same 5-part decision-unit card
+// (Gap Type -> Evidence -> Why it matters -> Next investigation ->
+// Decision impact) rather than rebuilding a second, divergent version of
+// it — see EvidenceRiskGapMatrix.tsx's own module docstring for the full
+// "one coherent workflow" design intent this reuse serves.
+export function GapCard({ g }: { g: ResearchGap }) {
   const { bg, color } = gapStyle(g.type)
   return (
     <div className="ev-card">
-      <div style={{ marginBottom: 8 }}>
+      <div style={{ marginBottom: 12 }}>
         <span className="tag" style={{ background: bg, color, border: '1px solid transparent' }}>
           {g.type}
         </span>
       </div>
-      <p style={{ margin: '0 0 12px', fontSize: 13, color: 'var(--ink-1)', lineHeight: 1.6 }}>
-        {g.rationale}
-      </p>
-      <div className="suggestion-box">
+      <GapSection label="Evidence" labelColor="var(--ink-3)">{g.evidence}</GapSection>
+      <GapSection label="Why it matters" labelColor="var(--ink-3)">{g.whyItMatters}</GapSection>
+      <div className="suggestion-box" style={{ marginBottom: 10 }}>
         <div style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: '0.06em', textTransform: 'uppercase', color: '#3b82f6', marginBottom: 5 }}>
-          Suggested next step
+          Next investigation
         </div>
         <div style={{ fontSize: 12.5, lineHeight: 1.6 }}>{g.suggestion}</div>
       </div>
+      <GapSection label="Decision impact" labelColor={color}>{g.decisionImpact}</GapSection>
     </div>
   )
 }
@@ -437,16 +505,28 @@ function GapsTab({ items, checked }: { items: ResearchGap[]; checked: boolean })
 
 /* ─── Main TargetDetail ────────────────────────────────────────────────────── */
 
-type TabId = 'evidence' | 'contradictions' | 'gaps'
+export type TabId = 'report' | 'evidence' | 'contradictions' | 'gaps' | 'network'
 
 interface Props {
   targetId: number
   initial: Target   // the summary already fetched by TargetList — rendered immediately; re-fetched below to reflect the latest persisted state (real GET reads only, no recomputation — see api.ts)
   onBack: () => void
+  // Lets a ppi_partner node on the Evidence Network tab that is ALSO one of
+  // this pipeline's own candidate targets navigate straight to that gene's
+  // own detail page (see EvidenceNetwork.tsx) — App.tsx resolves the id
+  // against the already-fetched target list, no extra fetch needed.
+  onNavigateToTarget: (targetId: number) => void
+  // Which tab to land on when this page first opens (this task — the
+  // Evidence + Risk + Gap Matrix's "click the target name" action opens
+  // straight to 'report', the full Single-Target Report, per that
+  // feature's own explicit design intent). Defaults to 'evidence',
+  // unchanged from every existing caller (TargetList, Evidence Network
+  // node clicks, the legacy Portfolio Comparison table).
+  initialTab?: TabId
 }
 
-export default function TargetDetail({ targetId, initial, onBack }: Props) {
-  const [tab, setTab] = useState<TabId>('evidence')
+export default function TargetDetail({ targetId, initial, onBack, onNavigateToTarget, initialTab }: Props) {
+  const [tab, setTab] = useState<TabId>(initialTab ?? 'evidence')
   const [t, setT] = useState<Target>(initial)
   const [refreshing, setRefreshing] = useState(true)
   const [analyzing, setAnalyzing] = useState(false)
@@ -513,6 +593,185 @@ export default function TargetDetail({ targetId, initial, onBack }: Props) {
 
   return (
     <div style={{ maxWidth: 1000 }}>
+      {/* ── "Why This Target?" card ───────────────────────────────────────
+          Decision-layer strategy priority #1 — deliberately the FIRST
+          thing rendered on this page, above even the caution banner and
+          the score header, per this feature's own design goal (a
+          structured, decision-ready explanation instead of just a
+          number). `confidence`/`evidenceMaturity`/`mainRemainingUncertainty`
+          are decided deterministically on the backend (see
+          app/core/narration/agent_narrator.py's build_why_this_target_
+          grounding_data() docstring) — the LLM only ever phrases the 3
+          `bullets`. `null` means the real backend call is unavailable
+          right now (no GROQ_API_KEY, or a real Groq rate/token limit —
+          confirmed hit live while building this feature), rendered as an
+          honest, non-blocking notice rather than silently hidden or
+          faked. */}
+      {t.whyThisTarget ? (
+        <div className="surface" style={{ padding: '18px 22px', marginBottom: 20, border: '1px solid var(--seq-550)' }}>
+          <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--ink-1)', marginBottom: 10 }}>
+            Why {t.gene} Ranks as It Does
+          </div>
+          <ul style={{ margin: '0 0 12px', paddingLeft: 18, display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {t.whyThisTarget.bullets.map((b, i) => (
+              <li key={i} style={{ fontSize: 12.5, color: 'var(--ink-1)', lineHeight: 1.5 }}>{b}</li>
+            ))}
+          </ul>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16, fontSize: 12, color: 'var(--ink-2)' }}>
+            <span><strong style={{ color: 'var(--ink-1)' }}>Confidence:</strong> {t.whyThisTarget.confidence}</span>
+            <span><strong style={{ color: 'var(--ink-1)' }}>Evidence maturity:</strong> {t.whyThisTarget.evidenceMaturity}</span>
+          </div>
+          <p style={{ margin: '8px 0 0', fontSize: 12, color: 'var(--ink-2)', lineHeight: 1.5 }}>
+            <strong style={{ color: 'var(--ink-1)' }}>Main remaining uncertainty:</strong> {t.whyThisTarget.mainRemainingUncertainty}
+          </p>
+        </div>
+      ) : (
+        <div className="surface" style={{ padding: '12px 18px', marginBottom: 20, fontSize: 12, color: 'var(--ink-3)' }}>
+          "Why This Target?" narrative unavailable right now (the real LLM call may be rate-limited or the API key
+          unconfigured) — dimension scores and gaps below are unaffected.
+        </div>
+      )}
+
+      {/* ── Translational Opportunity ────────────────────────────────────
+          A lightweight, DETERMINISTIC, rule-based category — explicitly a
+          PROTOTYPE FRAMEWORK, NOT a validated business score, and NEVER
+          merged into the Priority Score section below: kept as its own,
+          always-separate, always-labeled card. Real requirement enforced
+          server-side (see app/core/classification/translational_
+          opportunity.py): a target with a real caution flag can never
+          land in a purely positive category here — "De-risking Needed"
+          always wins over Clinical-Stage/Preclinical High-Confidence
+          regardless of how strong priority/maturity otherwise look. */}
+      {t.translationalOpportunity && (
+        <div className="surface" style={{ padding: '16px 20px', marginBottom: 20 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8, flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--ink-3)' }}>
+              Translational Opportunity
+            </span>
+            <span style={{
+              fontSize: 9.5, fontWeight: 700, letterSpacing: '0.03em', textTransform: 'uppercase',
+              padding: '1px 6px', borderRadius: 4, background: 'var(--status-neutral-bg)', color: 'var(--ink-3)',
+            }}>
+              Prototype — not a validated score
+            </span>
+          </div>
+          {(() => {
+            const s = opportunityStyle(t.translationalOpportunity.category)
+            return (
+              <span className="badge" style={{ background: s.bg, color: s.color, fontSize: 12.5, fontWeight: 700, marginBottom: 8 }}>
+                {t.translationalOpportunity.category}
+              </span>
+            )
+          })()}
+          <p style={{ margin: '8px 0 0', fontSize: 12.5, color: 'var(--ink-2)', lineHeight: 1.55 }}>
+            {t.translationalOpportunity.rationale}
+          </p>
+        </div>
+      )}
+
+      {/* ── Caution Flags banner ─────────────────────────────────────────
+          ONE shared visual pattern for every real "risk/caution fact, not
+          a strength score" signal this pipeline surfaces (per this task's
+          own explicit instruction) — currently real Known Safety Events
+          (dimension="safety_signal") and real Gene Essentiality
+          (dimension="essentiality_risk", Open Targets/DepMap — see
+          app/ingestion/open_targets_client.py's
+          get_essentiality_and_paralogues() docstring). Rendered ABOVE the
+          score header, independent of any dimension score or either
+          signal's own (stricter, high-evidence-only) gap trigger — a real
+          flag is surfaced here unconditionally whenever ANY real instance
+          exists for this gene, never averaged into a score or buried in a
+          tab. The two kinds are visually one banner but distinctly
+          labeled within it (never conflated — an observed clinical event
+          and a predictive cell-line-derived risk score carry different
+          real confidence levels). Real finding across all 5 ALS candidate
+          genes: SOD1 and TARDBP are flagged essential (this DOES render
+          for them); zero documented safety events exist for any of the 5
+          (that kind never renders) — see CLAUDE.md. */}
+      {t.cautionFlags.length > 0 && (
+        <div
+          className="surface"
+          style={{
+            padding: '16px 20px', marginBottom: 20,
+            background: 'var(--status-crit-bg)', border: '1px solid var(--status-crit)',
+            display: 'flex', gap: 14, alignItems: 'flex-start',
+          }}
+        >
+          <span style={{ fontSize: 22, lineHeight: 1, flexShrink: 0 }} aria-hidden="true">⚠</span>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--status-crit)', marginBottom: 6 }}>
+              {t.cautionFlags.length} Real Caution Flag{t.cautionFlags.length > 1 ? 's' : ''} — {t.gene}
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {t.cautionFlags.map((f: CautionFlag, i) => (
+                <div key={i} style={{ fontSize: 12.5, color: 'var(--ink-1)' }}>
+                  <span style={{
+                    fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: 0.3,
+                    color: 'var(--status-crit)', border: '1px solid var(--status-crit)',
+                    borderRadius: 4, padding: '1px 5px', marginRight: 6,
+                  }}>
+                    {f.kind === 'safety_event' ? 'Safety Event' : 'Essentiality'}
+                  </span>
+                  <strong>{f.title}</strong>
+                  <span style={{ color: 'var(--ink-3)' }}> — {f.detail}</span>
+                  {f.sourceUrl && (
+                    <>
+                      {' · '}
+                      <a href={f.sourceUrl} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--seq-550)' }}>
+                        source ↗
+                      </a>
+                    </>
+                  )}
+                </div>
+              ))}
+            </div>
+            <p style={{ margin: '8px 0 0', fontSize: 11.5, color: 'var(--ink-2)', lineHeight: 1.5 }}>
+              Real, documented findings from Open Targets — neither is an automatic disqualifier. A safety
+              event varies widely in severity and relevance to this specific disease/modality context; an
+              essentiality flag reflects a complete CRISPR knockout's effect in proliferating cancer cell
+              lines, not necessarily the safety of a specific therapeutic modality (e.g. a partial,
+              tissue-targeted knockdown) in a specific human tissue. Review the source(s) above before
+              drawing a conclusion.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* ── Paralogues card ───────────────────────────────────────────────
+          Real Open Targets human paralogue data (dimension="paralogy") —
+          deliberately NOT part of the caution banner above: a paralogue
+          relationship is genuinely two-sided (see
+          scripts/ingest_evidence.py's _build_paralogy_fields() docstring),
+          so this renders as a separate, neutral informational card, not a
+          warning. */}
+      {t.paralogues.length > 0 && (
+        <div className="surface" style={{ padding: '14px 20px', marginBottom: 20 }}>
+          <div style={{ fontSize: 12.5, fontWeight: 700, color: 'var(--ink-1)', marginBottom: 6 }}>
+            Real Human Paralogue{t.paralogues.length > 1 ? 's' : ''} — {t.gene} ({t.paralogues.length})
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 6 }}>
+            {t.paralogues.map((p, i) => (
+              <span key={i} style={{
+                fontSize: 12, padding: '3px 8px', borderRadius: 5,
+                background: 'var(--status-neutral-bg)', color: 'var(--ink-1)',
+              }}>
+                {p.sourceUrl ? (
+                  <a href={p.sourceUrl} target="_blank" rel="noopener noreferrer" style={{ color: 'inherit' }}>
+                    {p.gene}
+                  </a>
+                ) : p.gene} <span style={{ color: 'var(--ink-3)' }}>{p.identityPercent.toFixed(1)}%</span>
+              </span>
+            ))}
+          </div>
+          <p style={{ margin: 0, fontSize: 11.5, color: 'var(--ink-2)', lineHeight: 1.5 }}>
+            A two-sided signal, not scored: a close paralogue could provide functional backup if this
+            target's own function is disrupted (a risk-reducing property), or could reduce a
+            knockdown/knockout drug's effectiveness through redundancy (a modality risk) — see this
+            target's Modality gap for whether a specific paralogue is flagged as note-worthy there.
+          </p>
+        </div>
+      )}
+
       {/* ── Header ───────────────────────────────────────────────────── */}
       <div className="surface" style={{ padding: '24px 28px', marginBottom: 20 }}>
         <div style={{ display: 'flex', alignItems: 'flex-start', gap: 24 }}>
@@ -630,7 +889,10 @@ export default function TargetDetail({ targetId, initial, onBack }: Props) {
       <MomentumChart momentum={t.momentum} gene={t.gene} />
 
       {/* ── Dimension cards ──────────────────────────────────────────── */}
-      <div style={{ display: 'flex', gap: 14, marginBottom: 24 }}>
+      {/* flexWrap added (this task): Target.dimensions grew from 4 to all
+          9 real MVP dimensions (see api.ts's DIMENSION_ORDER), so this row
+          needs to wrap instead of squeezing 9 cards into one line. */}
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 14, marginBottom: 24 }}>
         {t.dimensions.map(d => <DimCard key={d.label} d={d} />)}
       </div>
 
@@ -644,9 +906,11 @@ export default function TargetDetail({ targetId, initial, onBack }: Props) {
           gap: 4,
         }}>
           {([
+            { id: 'report',          label: 'Report',          count: 0                          },
             { id: 'evidence',        label: 'Evidence',        count: t.evidenceItems.length    },
             { id: 'contradictions',  label: 'Contradictions',  count: t.contradictions.length   },
             { id: 'gaps',            label: 'Research Gaps',   count: t.gaps.length             },
+            { id: 'network',         label: 'Evidence Network',count: t.graph.nodes.length       },
           ] as { id: TabId; label: string; count: number }[]).map(({ id, label, count }) => (
             <button
               key={id}
@@ -670,9 +934,11 @@ export default function TargetDetail({ targetId, initial, onBack }: Props) {
 
         {/* Tab content */}
         <div style={{ padding: '22px 24px' }}>
+          {tab === 'report'         && <TargetReport      t={t}                    />}
           {tab === 'evidence'       && <EvidenceTab       items={t.evidenceItems}  />}
           {tab === 'contradictions' && <ContradictionsTab items={t.contradictions} checked={t.contradictionsChecked} />}
           {tab === 'gaps'           && <GapsTab           items={t.gaps}           checked={t.gapsChecked}           />}
+          {tab === 'network'        && <EvidenceNetwork   graph={t.graph}          onNavigateToTarget={onNavigateToTarget} />}
         </div>
       </div>
     </div>

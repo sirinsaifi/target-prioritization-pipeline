@@ -97,6 +97,48 @@ STRING_HIGH_CONFIDENCE_THRESHOLD = 700
 # externally published reference — a documented judgment call.
 PPI_HUB_SCORE_CEILING = 100
 
+# Dimensions whose real evidence_score has a KNOWN scoring-FORMULA
+# limitation that can make a real, meaningful result look artificially
+# weak — distinct from a dimension simply having low real evidence. Found
+# and documented after a real, live-confirmed case: a gene with 10 real
+# high-confidence STRING partners (a genuinely meaningful interactome)
+# scores ppi_network=0.10 purely because score_ppi_hub() divides the real
+# partner count by PPI_HUB_SCORE_CEILING (100) above — an arbitrary,
+# project-chosen denominator, not a reflection of how weak the evidence
+# actually is. Consumers that pick "the lowest-scoring dimension" as a
+# stand-in for "the weakest real evidence" (see
+# app.core.narration.agent_narrator.build_why_this_target_grounding_data())
+# must skip dimensions in this set, or they will systematically
+# mis-attribute uncertainty to a formula artifact rather than a real gap.
+#
+# Every other scorer in dimension_scoring.py was checked against this same
+# question and deliberately NOT added here:
+# - score_genetic_l2g / score_clinical_precedence / score_drug_target: a
+#   direct real value (L2G score) or a real, OTP-published stage->score
+#   lookup table — a low result there IS the real, intended signal
+#   (early-stage/preclinical, or weak L2G), not an arbitrary cap.
+# - score_pathway_curated: binary 1.0/0.0, no partial-scoring ceiling to
+#   distort.
+# - score_literature_cooccurrence / score_experimental: both pass through
+#   an already-normalized real 0-1 value (OTP's own confidence/score
+#   field) unchanged — no additional denominator introduced by this
+#   project at all.
+# - score_tissue_specificity (HPA): a real categorical bucket
+#   (TISSUE_SPECIFICITY_SCORES) reflecting HPA's own real specificity
+#   category — a low score here genuinely means "broadly expressed", not
+#   an artifact of an arbitrary count/ceiling division.
+# - compute_tau_specificity (GTEx): the real, published Yanai et al. tau
+#   statistic — not a prototype approximation at all (see that function's
+#   own docstring), so no formula-limitation concern applies.
+# - score_omics_expression: never exercised by real data in this project
+#   (see EXPRESSION_ATLAS_DATASOURCE_ID), so it can never actually be
+#   picked as a real "lowest dimension" today — not added preemptively;
+#   revisit if real omics data is ever ingested.
+# score_ppi_hub is the ONLY scorer whose low end is a "real count divided
+# by an arbitrary, project-chosen ceiling" shape, which is what makes it
+# uniquely misleading as a standalone weakness signal.
+DIMENSIONS_WITH_SCORING_FORMULA_LIMITATIONS = {"ppi_network"}
+
 # Real OTP schema-level datasourceId for differential-expression evidence
 # (Expression Atlas), per platform-docs.opentargets.org/evidence. CONFIRMED
 # via live introspection this returns ZERO real rows for all 5 ALS
@@ -147,6 +189,37 @@ GENETIC_DATATYPE_ID = "genetic_association"
 # candidate pool is tried to reliably reach MAX_RECORDS real ones).
 LITERATURE_CONTRADICTION_MAX_RECORDS = 5
 LITERATURE_CONTRADICTION_MAX_CANDIDATES = 15
+
+# --- Literature contradiction proposer: biomedical LLM option (new task) ---
+#
+# The proposer (app/core/verification/literature_contradiction_proposer.py)
+# reads real abstract text and judges CONTRADICT/SUPPORT/UNRELATED — the one
+# LLM use in this codebase where domain knowledge genuinely helps (unlike
+# narration or the investigation loop, which only need fluent
+# instruction-following over already-computed facts). Groq's
+# openai/gpt-oss-20b remains the DEFAULT — this is an additional option, not
+# a replacement, selected via the LITERATURE_LLM_PROVIDER environment
+# variable ("groq" | "biomedical"; unset or unrecognized -> "groq").
+#
+# REAL, LIVE-CONFIRMED FINDING (checked via HuggingFace's public model API,
+# not assumed): neither of the two originally-proposed candidates —
+# BioMistral/BioMistral-7B nor aaditya/Llama3-OpenBioLLM-8B — currently has
+# ANY active HF Inference Provider (`inferenceProviderMapping` is a literal
+# `{}` for both, confirmed against a live control model that DOES show real
+# provider entries with status "live"). HuggingFace also fully retired the
+# old `api-inference.huggingface.co` serverless domain (DNS no longer
+# resolves) in favor of the unified `router.huggingface.co` "Inference
+# Providers" API used below. Searching HF's own model hub for other
+# biomedical-domain models that ARE currently live turned up
+# Intelligent-Internet/II-Medical-8B (Qwen3-8B base, SFT+RL-tuned on medical
+# reasoning datasets, scores 40% on OpenAI's HealthBench per its model
+# card) — confirmed live today on the `featherless-ai` provider — used here
+# instead. Revisit this constant if BioMistral/OpenBioLLM ever become
+# provider-hosted again; the calling code
+# (app.core.llm_client.call_llm_plain_biomedical()) is generic to any
+# HF-hosted chat model and does not need to change.
+BIOMEDICAL_LLM_MODEL = "Intelligent-Internet/II-Medical-8B"
+BIOMEDICAL_LLM_INFERENCE_PROVIDER = "featherless-ai"
 
 # --- Scoring thresholds (OTP-referenced; treat as prototype defaults) ---
 
@@ -208,7 +281,64 @@ COMPARABILITY_FIELDS_BY_SOURCE_TYPE = {
     # list + no direction_on_trait), not merely under-populated like omics.
     "tissue_expression": [],
     "ppi_network": [],
+    # New (this task). Known Safety Events (Target.safetyLiabilities) is a
+    # gene-level, disease-agnostic annotation like pathway/ppi_network
+    # above — no direction_on_trait, no disease-association claim to
+    # compare across records at all. Structurally excluded from
+    # contradiction classification for the same reason; surfaced instead
+    # via a dedicated gap type and a UI warning banner (see
+    # app/core/gaps/gap_taxonomy.py, deliberately never scored 0-1 — see
+    # scripts/ingest_evidence.py's _build_safety_signal_fields() docstring).
+    "safety_signal": [],
+    # New (this task). Real Open Targets Target Prioritisation Factor: Gene
+    # Essentiality (Target.isEssential / Target.depMapEssentiality). Same
+    # "gene-level, disease-agnostic, no direction_on_trait" reasoning as
+    # safety_signal above — structurally excluded from contradiction
+    # classification, surfaced instead via a dedicated gap type + UI
+    # caution flag (see scripts/ingest_evidence.py's
+    # _build_essentiality_fields() docstring). Deliberately a SEPARATE
+    # source_type from "safety_signal", not folded into it: essentiality is
+    # a predictive/mechanistic risk signal computed from DepMap CRISPR
+    # knockout screens in proliferating cancer cell lines, categorically
+    # different from an observed real-world clinical safety liability —
+    # conflating the two would misrepresent how much confidence each
+    # actually carries.
+    "essentiality_risk": [],
+    # New (this task). Real Open Targets homologue data (Target.homologues,
+    # filtered to real human paralogues) plus OTP's own
+    # paralogMaxIdentityPercentage prioritisation factor. Gene-level,
+    # disease-agnostic, no direction_on_trait — structurally excluded from
+    # contradiction classification for the same reason as pathway/
+    # ppi_network/safety_signal/essentiality_risk above. Deliberately its
+    # OWN source_type, not folded into "genetic": a paralogue relationship
+    # is a two-sided druggability/redundancy signal (see
+    # scripts/ingest_evidence.py's _build_paralogy_fields() docstring), not
+    # genetic evidence of disease association.
+    "paralogy": [],
 }
+
+# Real Open Targets Target Prioritisation Factor threshold for Paralogues
+# (paralogMaxIdentityPercentage), confirmed via
+# platform-docs.opentargets.org/web-interface/target-prioritisation: OTP
+# itself only flags a paralogue as "concerning" (its own factor score goes
+# negative) at >=60% sequence identity to a real human paralogue. Checked
+# live against all 5 real ALS candidates before choosing a project-level
+# threshold: NONE of them cross OTP's own 60% cutoff (SOD1's highest real
+# hit, CCS, is ~47%; FUS's highest, EWSR1, is ~56% — close, but still under
+# 60%). Using OTP's own 60% threshold here would mean this project's
+# Modality-gap paralogue note could never fire on any of today's real data,
+# even for FUS's well-known, real FET-family relationship (EWSR1/TAF15).
+# EXPLICIT, DISCLOSED JUDGMENT CALL (this task): a separate, more inclusive
+# project-chosen threshold of 40% is used ONLY for deciding whether to add
+# an informational note to the Modality gap's own text (never to change
+# whether the gap fires, and never applied to OTP's own prioritisation
+# factor, which keeps its real, official 60% cutoff untouched in
+# get_essentiality_and_paralogues()'s docstring/data). This is deliberately
+# NOT the same number as OTP's own factor threshold — it exists to let a
+# real, biologically meaningful relationship like FUS/EWSR1 surface in this
+# project's own gap wording, while being explicit that this is our own
+# choice, not OTP's.
+PARALOGUE_MODALITY_NOTE_IDENTITY_THRESHOLD = 40.0
 
 # Map each concrete data source to its source-type group (extend as new
 # sources are added during ingestion)
@@ -237,8 +367,48 @@ SOURCE_TYPE_BY_DATA_SOURCE = {
     # (population/endpoint/intervention); `intervention` (the drug name)
     # is the one that genuinely applies here too.
     "chembl_drug_target": "clinical",
+    # New (this task). Direct ClinicalTrials.gov API v2 pull — a second,
+    # independent human_clinical source alongside clinical_precedence (see
+    # app/ingestion/clinicaltrials_gov_client.py's module docstring for the
+    # real gap this closes: OTP's clinical_precedence returns zero rows for
+    # C9orf72 vs ALS, missing 2 real, well-documented discontinued ASO
+    # trials — BIIB078 and WVE-004 — that this source recovers). Same
+    # "clinical" comparability group as clinical_precedence/
+    # chembl_drug_target (same real fields apply: population/endpoint/
+    # intervention).
+    "clinicaltrials_gov": "clinical",
     "hpa": "tissue_expression",
+    # New (this task). Second, independent tissue_expression source
+    # alongside HPA — real healthy-donor median expression (GTEx), not a
+    # new "omics"/differential-expression dimension (see
+    # app/ingestion/gtex_client.py's module docstring for the full
+    # reasoning). Same "two sources, one existing dimension" pattern
+    # already used for literature (europepmc/pubmed) and human_clinical
+    # (clinical_precedence/clinicaltrials_gov).
+    "gtex": "tissue_expression",
     "string": "ppi_network",
+    # New (this task). Real Open Targets Target Prioritisation Factors —
+    # Known Safety Events and Genetic Constraint (see
+    # app/ingestion/open_targets_client.py's get_prioritisation_and_safety()
+    # docstring for the full field semantics). Genetic constraint is a
+    # real, disease-agnostic gene annotation folded into the existing
+    # "genetic" comparability group (same pattern as pathway/drug_target
+    # being folded into their groups); Known Safety Events gets its own
+    # "safety_signal" group (see COMPARABILITY_FIELDS_BY_SOURCE_TYPE above
+    # for why it's structurally excluded from contradiction classification,
+    # same as pathway/ppi_network).
+    "ot_genetic_constraint": "genetic",
+    "ot_safety": "safety_signal",
+    # New (this task). Real Open Targets Target Prioritisation Factors:
+    # Gene Essentiality and Paralogues (see
+    # app/ingestion/open_targets_client.py's get_essentiality_and_paralogues()
+    # docstring for the full real field semantics, confirmed via
+    # platform-docs.opentargets.org). Both deliberately excluded from every
+    # structural/druggability prioritisation factor (hasLigand, hasPocket,
+    # isInMembrane, etc.) per this task's own scope instruction — only
+    # these two simple, non-structural OTP fields are queried.
+    "ot_essentiality": "essentiality_risk",
+    "ot_paralogy": "paralogy",
 }
 
 # Deprecated: kept only for backward compatibility with earlier prototype
@@ -251,6 +421,55 @@ COMPARABILITY_FIELDS = ["tissue", "disease_subtype", "population", "assay_type",
 # to be validated against domain-expert assessment per mentor feedback)
 EVIDENCE_CONSISTENCY_GAP_THRESHOLD = 0.5
 EVIDENCE_STRENGTH_HIGH_THRESHOLD = 0.7
+
+# --- "Why This Target?" structured narrative (decision-layer strategy) ---
+#
+# Confidence label (High/Medium/Low), derived from real evidence_consistency.
+# Prototype cutoffs, same status as every other threshold in this file —
+# NOT an externally published reference. The Low/Medium boundary
+# deliberately REUSES EVIDENCE_CONSISTENCY_GAP_THRESHOLD (0.5) rather than
+# introducing a second, slightly-different number for what is conceptually
+# the same "this is where consistency starts being a real concern" line the
+# evidence_consistency gap already uses.
+CONFIDENCE_HIGH_THRESHOLD = 0.8  # >= this -> "High"
+CONFIDENCE_LOW_THRESHOLD = EVIDENCE_CONSISTENCY_GAP_THRESHOLD  # < this -> "Low"; between the two -> "Medium"
+
+# Evidence maturity label (High/Medium/Low), derived from real
+# evidence_maturity (the DIMENSION_MATURITY_LADDER rung reached — see
+# evidence_profile.py). Thresholds chosen against that ladder's own real
+# values: >=0.9 means the human_clinical (1.0) or drug_target (0.9) rung
+# was reached (translationally the most advanced evidence this project
+# scores); <0.4 means only literature (0.2), omics (0.3), or
+# tissue_expression (0.25) was reached (the least advanced); everything
+# else (genetic 0.4 through ppi_network 0.45 / pathway 0.5 / experimental
+# 0.7) is "Medium". Prototype cutoffs, not an externally published scale.
+MATURITY_HIGH_THRESHOLD = 0.9
+MATURITY_LOW_THRESHOLD = 0.4
+
+# "Main remaining uncertainty" gap-type priority order (this task's own
+# judgment call, documented rather than left arbitrary): when a target has
+# more than one open EVIDENCE-COMPLETENESS gap (excludes the two risk-flag
+# gap types below, which are already surfaced via their own caution-flag
+# bullet, not as an "uncertainty"), the first type in this list that's
+# actually present is picked as the single most relevant one to name.
+# Reasoning: a confirmed disagreement in the evidence itself
+# (evidence_consistency) is treated as more fundamental than simply having
+# no human data yet (validation), which in turn is treated as more
+# fundamental than an unclear mechanism (mechanistic) or a missing compound
+# (modality) or a narrow population sample (population) — each of the
+# latter three is a real but comparatively more "expected, next-step"
+# limitation for an early-stage target than the first two.
+WHY_THIS_TARGET_UNCERTAINTY_GAP_PRIORITY = [
+    "evidence_consistency", "validation", "mechanistic", "modality", "population",
+]
+# These two gap types are deliberately EXCLUDED from the priority list
+# above — they fire because a real fact EXISTS (a safety event or an
+# essentiality flag), not because evidence is missing, and are already
+# reported via the "why this target" caution-flags bullet, so naming one
+# again as the "main remaining uncertainty" would double-count it under a
+# misleading label (a documented risk is not the same kind of "gap" as
+# missing evidence).
+WHY_THIS_TARGET_UNCERTAINTY_EXCLUDED_GAP_TYPES = {"safety_signal", "essentiality_risk"}
 
 # --- Evidence Profile: Consistency & Maturity (original contribution, not
 # from OTP — OTP does not publish per-target consistency/maturity scores) ---

@@ -217,6 +217,18 @@ def run_literature_contradiction_check(target_id: int, db: Session = Depends(get
             rejected_count += 1
             continue
 
+        # Which LLM actually produced this proposal — "llm_proposer" for the
+        # default/existing Groq path (kept exactly as before, so nothing
+        # about already-persisted rows or existing consumers of this string
+        # changes), suffixed for the new biomedical-LLM option or an
+        # automatic Groq-quota fallback (see
+        # literature_contradiction_proposer.propose_literature_contradiction()'s
+        # docstring) — self-describing, same convention as the
+        # "structured_classifier" vs "llm_proposer" distinction this column
+        # already carries (see ContradictionLog's own docstring).
+        used_provider = proposal.get("provider", "groq")
+        proposed_by = "llm_proposer" if used_provider == "groq" else f"llm_proposer_{used_provider}"
+
         log = ContradictionLog(
             target_id=target_id,
             evidence_record_a_id=rec_a.id,
@@ -225,7 +237,7 @@ def run_literature_contradiction_check(target_id: int, db: Session = Depends(get
             matched_fields=None,  # no structured fields exist for literature — nothing to name here
             mismatched_fields=None,
             status="confirmed",
-            proposed_by="llm_proposer",
+            proposed_by=proposed_by,
             verification_reason=verification.reason,
         )
         db.add(log)

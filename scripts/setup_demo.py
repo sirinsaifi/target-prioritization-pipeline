@@ -34,13 +34,13 @@ from fastapi import HTTPException
 
 from app.config import CANDIDATE_TARGETS
 from app.db.database import SessionLocal, init_db
-from app.db.models import Target, EvidenceRecord
+from app.db.models import Target
 from app.api.routes.targets import seed_targets
 from app.api.routes.contradictions import run_contradiction_check, run_literature_contradiction_check
 from app.api.routes.scoring import compute_scores
 from app.api.routes.gaps import run_gap_analysis
 from app.api.routes.momentum import get_momentum
-from scripts.ingest_evidence import ingest_target
+from scripts.ingest_evidence import ingest_target, clear_evidence_and_downstream_analysis
 
 # Deliberate prototype-scale mitigation, not a full retry/backoff strategy
 # (this file is orchestration, not new logic) — spaces out the real LLM
@@ -195,14 +195,23 @@ def main():
         print("Seeding candidate targets...")
         seed_targets(db)
 
-        # Clear prior evidence before re-ingesting — same "clear before
-        # re-insert" prototype convention as scripts/ingest_evidence.py's
-        # own main(), so re-running this script doesn't accumulate
-        # duplicate evidence records.
-        deleted = db.query(EvidenceRecord).delete()
-        if deleted:
-            db.commit()
-            print(f"Cleared {deleted} existing evidence records before re-ingesting.")
+        # Clear prior evidence AND every downstream analysis table computed
+        # from it (ContradictionLog/GapRecord/PriorityScore/PipelineRunLog)
+        # before re-ingesting — same shared helper scripts/ingest_evidence.py's
+        # own main() uses, so re-running this script doesn't accumulate
+        # duplicate evidence records OR leave stale/mismatched conclusions
+        # pointing at evidence-record ids that get reused for a different
+        # gene on the next run (see clear_evidence_and_downstream_analysis()'s
+        # docstring for the real bug this prevents).
+        counts = clear_evidence_and_downstream_analysis(db)
+        if any(counts.values()):
+            print(
+                f"Cleared before re-ingesting: {counts['evidence_records']} evidence record(s), "
+                f"{counts['contradiction_log']} contradiction log row(s), "
+                f"{counts['gap_records']} gap record(s), "
+                f"{counts['priority_scores']} priority score(s), "
+                f"{counts['pipeline_run_log']} pipeline run log row(s)."
+            )
         print()
 
         genes = list(CANDIDATE_TARGETS.items())

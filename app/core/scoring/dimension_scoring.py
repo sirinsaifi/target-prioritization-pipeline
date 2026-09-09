@@ -256,6 +256,41 @@ def score_tissue_specificity(rna_tissue_specificity: str | None) -> float | None
     return TISSUE_SPECIFICITY_SCORES.get(rna_tissue_specificity.strip().lower())
 
 
+def compute_tau_specificity(median_expression_by_tissue: dict) -> float | None:
+    """
+    Tissue Expression dimension — GTEx, a second independent source
+    alongside HPA (see app/ingestion/gtex_client.py's module docstring for
+    why this is dimension="tissue_expression", not a new "omics"
+    dimension). The REAL, published tau tissue-specificity statistic
+    (Yanai et al. 2005, Bioinformatics) — score_tissue_specificity()
+    above explicitly could NOT compute this from HPA alone ("HPA's JSON
+    API doesn't expose a complete per-tissue expression vector in one
+    field"). GTEx's medianGeneExpression endpoint provides exactly that
+    real, complete vector (54 real tissues, confirmed live for SOD1/TP53),
+    making the actual statistic computable here for the first time in this
+    project — not a prototype approximation this time.
+
+    tau = sum(1 - x_i/x_max) / (n - 1) across all real tissues; 0.0 means
+    uniformly/ubiquitously expressed, 1.0 means fully tissue-specific.
+    Same 0-1 scale and "higher = more tissue-specific" direction as
+    score_tissue_specificity()'s TISSUE_SPECIFICITY_SCORES (which tops out
+    at 1.0 for "Tissue enriched"), so this can be used as a real,
+    continuously-computed evidence_score directly, without bucketing.
+
+    Returns None if fewer than 2 real tissues are available, or the gene
+    shows zero real expression everywhere (max <= 0) — genuine "cannot
+    compute" cases, not a fabricated 0.0.
+    """
+    values = list(median_expression_by_tissue.values())
+    if len(values) < 2:
+        return None
+    max_value = max(values)
+    if max_value <= 0:
+        return None
+    tau = sum(1 - (v / max_value) for v in values) / (len(values) - 1)
+    return round(tau, 4)
+
+
 def score_ppi_hub(high_confidence_partner_count: int) -> float:
     """
     PPI Network dimension — STRING high-confidence (combined_score > 700)

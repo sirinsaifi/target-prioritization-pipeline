@@ -21,7 +21,17 @@ GROQ_API_KEY is missing.
 
 import os
 
+from app.config import BIOMEDICAL_LLM_MODEL, BIOMEDICAL_LLM_INFERENCE_PROVIDER
+
 GROQ_MODEL = "openai/gpt-oss-20b"
+
+# HuggingFace's current, unified "Inference Providers" API — replaces the
+# now-fully-retired `api-inference.huggingface.co` serverless domain (DNS no
+# longer resolves at all, confirmed live while building this). OpenAI-
+# compatible chat-completions shape, same request/response contract as
+# Groq's own API — the model is addressed as "<hf_model_id>:<provider>" so
+# HF's router knows which specific Inference Provider to route the call to.
+HUGGINGFACE_ROUTER_URL = "https://router.huggingface.co/v1/chat/completions"
 
 
 def call_llm_with_tools(messages: list, tools: list) -> dict:
@@ -95,3 +105,47 @@ def call_llm_plain(messages: list) -> str:
     client = groq.Groq(api_key=api_key)
     response = client.chat.completions.create(model=GROQ_MODEL, messages=messages)
     return response.choices[0].message.content or ""
+
+
+def call_llm_plain_biomedical(messages: list) -> str:
+    """
+    Plain text turn against a real biomedical-domain LLM, via HuggingFace's
+    Inference Providers router (see HUGGINGFACE_ROUTER_URL above) — an
+    ADDITIONAL option for app/core/verification/literature_contradiction_proposer.py,
+    not a replacement for the Groq path elsewhere in this codebase. This is
+    the one place in the project where domain-specific medical knowledge
+    genuinely helps the task (judging whether two real literature excerpts
+    biologically CONTRADICT/SUPPORT/are UNRELATED), unlike narration or the
+    investigation loop, which only need fluent instruction-following over
+    facts already computed elsewhere.
+
+    Model/provider are read from app.config (BIOMEDICAL_LLM_MODEL /
+    BIOMEDICAL_LLM_INFERENCE_PROVIDER) — see that module for the real,
+    live-confirmed availability check behind the current choice.
+
+    Same "fail loudly, never fabricate" behavior as call_llm_plain() above
+    when HUGGINGFACE_API_TOKEN is missing — uses plain `requests` (already a
+    project dependency) rather than adding `huggingface_hub` for one call.
+    """
+    import requests
+
+    api_key = os.environ.get("HUGGINGFACE_API_TOKEN")
+    if not api_key:
+        raise RuntimeError(
+            "HUGGINGFACE_API_TOKEN is not set. The biomedical literature-contradiction "
+            "LLM path requires a free HuggingFace account + access token — set the "
+            "environment variable before calling it (or use LITERATURE_LLM_PROVIDER=groq, "
+            "the default, which does not need this token)."
+        )
+
+    response = requests.post(
+        HUGGINGFACE_ROUTER_URL,
+        headers={"Authorization": f"Bearer {api_key}"},
+        json={
+            "model": f"{BIOMEDICAL_LLM_MODEL}:{BIOMEDICAL_LLM_INFERENCE_PROVIDER}",
+            "messages": messages,
+        },
+        timeout=60,
+    )
+    response.raise_for_status()
+    return response.json()["choices"][0]["message"]["content"] or ""

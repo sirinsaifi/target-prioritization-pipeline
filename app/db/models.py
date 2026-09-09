@@ -93,7 +93,42 @@ class EvidenceRecord(Base):
     # not guessed.
     publication_year = Column(Integer, nullable=True)
 
+    # Real external identifier this source exposes that ISN'T already
+    # captured by an existing field — confirmed live per data_source (see
+    # app/core/presentation/source_links.py's module docstring for the
+    # full per-source investigation): OTP's real `clinicalReportId`
+    # (clinical_precedence — sometimes a real ClinicalTrials.gov NCT id,
+    # sometimes not), `credibleSet.studyLocusId` (gwas_credible_sets — a
+    # real Open Targets Platform credible-set page id), and the real
+    # STRING-internal protein id resolved during ingestion (string —
+    # previously computed and discarded, now captured). NULL for every
+    # other data_source: either the existing source_record_id/variant_id
+    # already IS the real external id (eva/uniprot_variants/europepmc/
+    # pubmed/reactome/chembl_drug_target), or no real per-record external
+    # id is exposed at all (orphanet/impc — a real, documented absence).
+    external_id = Column(String, nullable=True)
+
     target = relationship("Target", back_populates="evidence_records")
+
+    @property
+    def source_url(self) -> str | None:
+        """
+        Real, clickable external source link for this evidence record, or
+        None where no real single-record page exists — see
+        app/core/presentation/source_links.py.get_source_url() for the
+        live-tested mapping and the honest reasoning behind every None.
+        Computed on read, not stored: a pure function of already-real
+        fields (plus this row's own target.ensembl_id for hpa), so it can
+        never drift out of sync with a stored URL format that changes.
+        """
+        from app.core.presentation.source_links import get_source_url
+        return get_source_url(
+            data_source=self.data_source,
+            source_record_id=self.source_record_id,
+            variant_id=self.variant_id,
+            external_id=self.external_id,
+            ensembl_id=self.target.ensembl_id if self.target else None,
+        )
 
 
 class ContradictionLog(Base):
@@ -155,8 +190,18 @@ class GapRecord(Base):
     gap_type = Column(String, nullable=False)
     # one of: "mechanistic" | "population" | "modality" | "validation" | "evidence_consistency"
 
-    rationale = Column(Text, nullable=True)  # why this gap was triggered (rule + values)
-    investigation_suggestion = Column(Text, nullable=True)  # templated, not free-generated
+    rationale = Column(Text, nullable=True)  # why this gap was triggered (rule + values) — the "Evidence" part
+    investigation_suggestion = Column(Text, nullable=True)  # templated, not free-generated — the "Next investigation" part
+
+    # New (this task — "fully actionable gap" decision-layer feature).
+    # Completes the 5-part decision-unit format: Gap Type -> Evidence
+    # (rationale) -> Why it matters -> Next investigation
+    # (investigation_suggestion) -> Decision impact. Both TEMPLATED (see
+    # app/core/gaps/gap_taxonomy.py's WHY_IT_MATTERS/DECISION_IMPACT
+    # dicts), never freely LLM-generated — same deterministic-and-auditable
+    # discipline as rationale/investigation_suggestion above.
+    why_it_matters = Column(Text, nullable=True)
+    decision_impact = Column(Text, nullable=True)
 
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 

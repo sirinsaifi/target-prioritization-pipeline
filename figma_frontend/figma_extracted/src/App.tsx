@@ -1,7 +1,8 @@
 import { useState, useEffect } from 'react'
 import TargetList from './pages/tei/TargetList'
-import TargetDetail from './pages/tei/TargetDetail'
+import TargetDetail, { type TabId } from './pages/tei/TargetDetail'
 import PortfolioComparison from './pages/tei/PortfolioComparison'
+import EvidenceRiskGapMatrix from './pages/tei/EvidenceRiskGapMatrix'
 import type { Target } from './pages/tei/data'
 import { fetchTargetSummaries } from './pages/tei/api'
 
@@ -16,8 +17,15 @@ const NAV: { id: Screen; label: string; icon: string }[] = [
 export default function App() {
   const [screen, setScreen]         = useState<Screen>('targets')
   const [selected, setSelected]     = useState<Target | null>(null)
+  const [selectedTab, setSelectedTab] = useState<TabId | undefined>(undefined)
   const [targets, setTargets]       = useState<Target[] | null>(null)
   const [loadError, setLoadError]   = useState<string | null>(null)
+  // Evidence + Risk + Gap Matrix is the new main portfolio view; the
+  // original, more detailed Portfolio Comparison table (per-dimension
+  // breakdown, momentum, translational opportunity, etc.) remains
+  // available via a toggle rather than being removed — both show real
+  // data, the matrix is just the new default entry point.
+  const [portfolioView, setPortfolioView] = useState<'matrix' | 'detailed'>('matrix')
 
   useEffect(() => {
     let cancelled = false
@@ -27,8 +35,16 @@ export default function App() {
     return () => { cancelled = true }
   }, [])
 
-  const handleSelectTarget = (t: Target) => setSelected(t)
-  const handleBack          = ()          => setSelected(null)
+  const handleSelectTarget = (t: Target, tab?: TabId) => { setSelected(t); setSelectedTab(tab) }
+  const handleBack          = ()          => { setSelected(null); setSelectedTab(undefined) }
+  // Evidence Network tab: a PPI-partner node that is ALSO one of this
+  // pipeline's own candidate targets (e.g. SOD1's real STRING partners
+  // FUS/TARDBP) is clickable — resolve it against the already-fetched
+  // target list rather than an extra fetch.
+  const handleNavigateToTarget = (targetId: number) => {
+    const found = targets?.find(x => x.id === targetId)
+    if (found) { setScreen('targets'); handleSelectTarget(found) }
+  }
 
   return (
     <div style={{ display: 'flex', minHeight: '100vh', background: 'var(--page-bg)' }}>
@@ -208,12 +224,37 @@ export default function App() {
               Loading real target data from the backend (running contradictions → scoring → gaps for each gene)…
             </div>
           ) : selected ? (
-            <TargetDetail targetId={selected.id} initial={selected} onBack={handleBack} />
+            <TargetDetail targetId={selected.id} initial={selected} initialTab={selectedTab} onBack={handleBack} onNavigateToTarget={handleNavigateToTarget} />
           ) : screen === 'portfolio' ? (
-            <PortfolioComparison
-              targets={targets}
-              onSelectTarget={(t) => { setScreen('targets'); handleSelectTarget(t) }}
-            />
+            <div>
+              <div style={{ display: 'flex', gap: 6, marginBottom: 16 }}>
+                <button
+                  className={`nav-item ${portfolioView === 'matrix' ? 'active' : ''}`}
+                  style={{ width: 'auto', padding: '6px 14px' }}
+                  onClick={() => setPortfolioView('matrix')}
+                >
+                  Evidence + Risk + Gap Matrix
+                </button>
+                <button
+                  className={`nav-item ${portfolioView === 'detailed' ? 'active' : ''}`}
+                  style={{ width: 'auto', padding: '6px 14px' }}
+                  onClick={() => setPortfolioView('detailed')}
+                >
+                  Detailed Comparison
+                </button>
+              </div>
+              {portfolioView === 'matrix' ? (
+                <EvidenceRiskGapMatrix
+                  targets={targets}
+                  onSelectTarget={(t, tab) => { setScreen('targets'); handleSelectTarget(t, tab) }}
+                />
+              ) : (
+                <PortfolioComparison
+                  targets={targets}
+                  onSelectTarget={(t) => { setScreen('targets'); handleSelectTarget(t) }}
+                />
+              )}
+            </div>
           ) : (
             <TargetList targets={targets} onSelectTarget={handleSelectTarget} />
           )}

@@ -24,6 +24,15 @@ class EvidenceRecordOut(BaseModel):
     assay_type: str | None
     endpoint: str | None
     direction_on_trait: str | None
+    # Real, clickable external source link (or None where no real
+    # single-record page exists) — computed on read from already-real
+    # fields, see EvidenceRecord.source_url / app/core/presentation/source_links.py.
+    source_url: str | None
+    # New (this task) — needed to surface real safety_signal event names
+    # (e.g. "event=...; direction=...; datasource=...") to the frontend,
+    # which has no other structured field for them. Was never exposed
+    # here before since no prior consumer needed the free-text field.
+    notes: str | None
 
     class Config:
         from_attributes = True
@@ -68,11 +77,40 @@ class LiteratureContradictionRunOut(BaseModel):
 
 
 class GapOut(BaseModel):
+    """
+    A gap as a complete, 5-part decision unit (decision-layer strategy
+    priority #2): gap_type -> rationale ("Evidence") -> why_it_matters ->
+    investigation_suggestion ("Next investigation") -> decision_impact.
+    `why_it_matters`/`decision_impact` are new (this task) — see
+    app/core/gaps/gap_taxonomy.py's WHY_IT_MATTERS/DECISION_IMPACT dicts;
+    `rationale`/`investigation_suggestion` already existed before this
+    task and are unchanged in shape, only relabeled in this docstring.
+    """
     id: int
     target_id: int
     gap_type: str
     rationale: str | None
     investigation_suggestion: str | None
+    why_it_matters: str | None
+    decision_impact: str | None
+
+    class Config:
+        from_attributes = True
+
+
+class TranslationalOpportunityOut(BaseModel):
+    """
+    A lightweight, DETERMINISTIC, rule-based category (NOT a score, NOT
+    LLM-generated) — see app/core/classification/translational_opportunity.py's
+    module docstring for the full rule set. `is_prototype` is always True:
+    this is an explicitly-labeled prototype framework, never to be
+    presented as a validated business score. Kept as its own nested
+    object, never merged into PriorityScore or any dimension score, so it
+    can always be rendered as a visually separate section.
+    """
+    category: str
+    rationale: str
+    is_prototype: bool
 
     class Config:
         from_attributes = True
@@ -86,10 +124,15 @@ class GapAnalysisOut(BaseModel):
     all 4 MVP dimensions by design); the autonomous investigation loop is
     labeled "partial" whenever the agent didn't explore every dimension
     this run. See app.core.gaps.gap_taxonomy.describe_investigation_coverage().
+
+    Also carries `translational_opportunity` (folded in here rather than a
+    new endpoint — see app/api/routes/gaps.py's own reasoning: every real
+    ingredient it needs is already assembled by this same route).
     """
     gaps: list[GapOut]
     investigation_coverage: str
     dimensions_not_explored: list[str]
+    translational_opportunity: TranslationalOpportunityOut
 
 
 class PriorityScoreOut(BaseModel):

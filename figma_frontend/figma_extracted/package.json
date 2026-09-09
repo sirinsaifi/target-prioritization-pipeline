@@ -13,7 +13,8 @@
     "lucide-react": "^1.24.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "recharts": "^3.9.2"
+    "recharts": "^3.9.2",
+    "vis-network": "^10.1.2"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.0.0",
