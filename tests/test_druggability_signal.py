@@ -25,8 +25,15 @@ from app.core.classification.translational_opportunity import (
     TranslationalOpportunityInput, classify_translational_opportunity,
 )
 from app.ingestion.pharos_client import get_druggability_evidence, _parse_ligand_counts
-from app.config import TDL_SCORES, EVIDENCE_STRENGTH_HIGH_THRESHOLD
-from scripts.ingest_evidence import _build_druggability_fields
+from app.config import (
+    TDL_SCORES, EVIDENCE_STRENGTH_HIGH_THRESHOLD,
+    family_druggability_heuristic,
+    DRUGGABLE_FAMILIES_FAVORABLE, DRUGGABLE_FAMILIES_CHALLENGING,
+)
+from app.core.verification.pharos_cross_checks import (
+    disease_association_cross_check, ppi_cross_check, _parse_notes, _parse_partner_list,
+)
+from scripts.ingest_evidence import _build_druggability_fields, _format_ligand_activities
 
 
 # --- TDL scorer mapping (the prototype 0-1 scale) ---------------------------
@@ -266,3 +273,229 @@ def test_none_tdl_does_not_trigger_override():
     assert result.category == "Clinical-Stage"  # unchanged by None TDL
     assert "Tdark" not in result.rationale
     assert "Tclin" not in result.rationale
+
+
+# --- Signal A: novelty stored as its own field, separate from TDL -----------
+
+def test_novelty_stored_separate_from_tdl_score_in_notes():
+    """Novelty is its own field in notes (novelty=...), NOT merged into the
+    TDL-derived raw_value. TDL score (0.7 for Tchem) is in raw_value;
+    novelty (0.00039653) is in notes — two distinct signals, never conflated."""
+    row = {"sym": "SOD1", "name": "SOD1", "tdl": "Tchem", "fam": "Enzyme",
+           "description": None, "novelty": 0.00039653, "publication_count": 1229,
+           "ligand_count": 8, "drug_count": 0, "ligands": [], "als_association": None,
+           "ppi": {"stringdb_count": 485, "total_count": 485, "partner_symbols": []}}
+    fields = _build_druggability_fields(row)
+    assert fields["raw_value"] == 0.7  # TDL-derived, not novelty
+    parsed = _parse_notes(fields["notes"])
+    assert parsed["novelty"] == "0.00039653"
+    assert parsed["tdl"] == "Tchem"
+    # Novelty and TDL are distinct: a target can be low-novelty yet Tdark.
+    assert parsed["novelty"] != parsed["tdl"]
+
+
+def test_novelty_documented_as_understudied_not_same_as_tdl():
+    """The field-builder docstring must document that novelty represents
+    under-studied-relative-to-importance, NOT the same as TDL. Checked via
+    the module docstring of pharos_client (the canonical documentation point)."""
+    import app.ingestion.pharos_client as pc
+    assert "under-studied" in pc.__doc__.lower()
+    assert "not the same as tdl" in pc.__doc__.lower() or "distinct from tdl" in pc.__doc__.lower()
+
+
+# --- Signal B: protein family + prototype druggability heuristic ------------
+
+def test_family_heuristic_favorable_for_kinase_and_enzyme():
+    """Real ALS-gene families: SOD1=Enzyme, NEK1=Kinase — both favorable
+    (historically strong small-molecule druggability track record)."""
+    assert family_druggability_heuristic("Enzyme") == "favorable"
+    assert family_druggability_heuristic("Kinase") == "favorable"
+
+
+def test_family_heuristic_challenging_for_transcription_factor():
+    assert family_druggability_heuristic("Transcription Factor") == "challenging"
+
+
+def test_family_heuristic_neutral_for_null_and_unknown():
+    """3 of 5 real ALS genes (C9orf72/TARDBP/FUS) have fam=null -> neutral.
+    A real absence, not 'challenging'. Unknown families are also neutral."""
+    assert family_druggability_heuristic(None) == "neutral"
+    assert family_druggability_heuristic("Some Unknown Family") == "neutral"
+
+
+def test_family_heuristic_case_insensitive():
+    assert family_druggability_heuristic("kinase") == "favorable"
+    assert family_druggability_heuristic("KINASE") == "favorable"
+
+
+def test_family_heuristic_label_stored_in_notes():
+    """The heuristic label is stored in notes as family_druggability_heuristic=...,
+    visible context alongside the raw family name — never overrides TDL."""
+    row = {"sym": "NEK1", "name": "Nek1", "tdl": "Tchem", "fam": "Kinase",
+           "description": None, "novelty": 0.016, "publication_count": 62,
+           "ligand_count": 165, "drug_count": 0, "ligands": [], "als_association": None,
+           "ppi": {"stringdb_count": 83, "total_count": 88, "partner_symbols": []}}
+    fields = _build_druggability_fields(row)
+    parsed = _parse_notes(fields["notes"])
+    assert parsed["family"] == "Kinase"
+    assert parsed["family_druggability_heuristic"] == "favorable"
+    assert fields["raw_value"] == 0.7  # TDL still drives raw_value, not the family heuristic
+
+
+# --- Signal C: ligand activity detail (isdrug + activity type/value) --------
+
+def test_ligand_detail_stores_isdrug_and_activity_type_value():
+    """Per-compound isdrug (approved vs research) + activity type/value, not
+    just a count. Real SOD1 shape: 8 research ligands, all EC50 pChEMBL values."""
+    row = {"sym": "SOD1", "name": "SOD1", "tdl": "Tchem", "fam": "Enzyme",
+           "description": None, "novelty": 0.0004, "publication_count": 1229,
+           "ligand_count": 8, "drug_count": 0,
+           "ligands": [{"name": "compound A", "isdrug": False, "actcnt": 1,
+                        "activities": [{"type": "EC50", "value": 7.17, "moa": None}]},
+                       {"name": "compound B", "isdrug": False, "actcnt": 1,
+                        "activities": [{"type": "EC50", "value": 6.77, "moa": None}]}],
+           "als_association": None,
+           "ppi": {"stringdb_count": 485, "total_count": 485, "partner_symbols": []}}
+    fields = _build_druggability_fields(row)
+    notes = fields["notes"]
+    assert "isdrug=False" in notes
+    assert "EC50=7.17" in notes
+    assert "EC50=6.77" in notes
+    assert "compound A" in notes
+
+
+def test_format_ligand_activities_handles_multiple_types():
+    """A ligand with multiple activities (e.g. staurosporine: IC50 + IC50) is
+    formatted compactly as 'IC50=8.04, IC50=7.74'."""
+    activities = [{"type": "IC50", "value": 8.04, "moa": None},
+                  {"type": "IC50", "value": 7.74, "moa": None}]
+    assert _format_ligand_activities(activities) == "IC50=8.04, IC50=7.74"
+    assert _format_ligand_activities([]) == "none"
+
+
+def test_ligand_detail_none_when_no_ligands():
+    """C9orf72/FUS have zero ligands -> ligand_detail=none (real absence,
+    not a parse error). The aggregate count (ligand_count=0) is still stored."""
+    row = {"sym": "C9orf72", "name": "C9orf72", "tdl": "Tbio", "fam": None,
+           "description": None, "novelty": 0.0009, "publication_count": 581,
+           "ligand_count": 0, "drug_count": 0, "ligands": [], "als_association": None,
+           "ppi": {"stringdb_count": 111, "total_count": 111, "partner_symbols": []}}
+    fields = _build_druggability_fields(row)
+    parsed = _parse_notes(fields["notes"])
+    assert parsed["ligand_count"] == "0"
+    assert parsed["ligand_detail"] == "none"
+
+
+# --- Signal D (PRIORITY): disease-association cross-check vs OTP -------------
+
+def test_parse_notes_extracts_structured_fields():
+    notes = "tdl=Tchem; novelty=0.0004; als_disgenet_score=0.7; als_evidence=24 PubMed IDs"
+    parsed = _parse_notes(notes)
+    assert parsed["tdl"] == "Tchem"
+    assert parsed["novelty"] == "0.0004"
+    assert parsed["als_disgenet_score"] == "0.7"
+
+
+def test_disease_cross_check_agree_when_tiers_match():
+    """Real SOD1-shaped case: Pharos DisGeNET=0.7 (High) vs OTP Genetic=0.99
+    (High) -> AGREE. Both sources place SOD1's ALS evidence in the High band."""
+    pharos_notes = "als_disgenet_score=0.7; als_evidence=24 PubMed IDs"
+    breakdown = '{"genetic": 0.99, "literature": 1.0}'
+    result = disease_association_cross_check("SOD1", pharos_notes, breakdown)
+    assert result.check_type == "disease_association"
+    assert result.verdict == "agree"
+    assert "0.7" in result.pharos_value
+    assert "0.99" in result.pipeline_value
+
+
+def test_disease_cross_check_disagree_when_tiers_far_apart():
+    """Pharos Low (0.2) vs OTP High (0.9) -> DISAGREE (2-tier gap). A real,
+    surprising finding worth flagging — the two sources disagree on whether
+    this target has strong ALS evidence."""
+    pharos_notes = "als_disgenet_score=0.2"
+    breakdown = '{"genetic": 0.9}'
+    result = disease_association_cross_check("GENE", pharos_notes, breakdown)
+    assert result.verdict == "disagree"
+
+
+def test_disease_cross_check_partial_one_tier_gap():
+    """Pharos Medium (0.5) vs OTP High (0.9) -> PARTIAL (1-tier gap). A real
+    but milder disagreement, not a contradiction."""
+    pharos_notes = "als_disgenet_score=0.5"
+    breakdown = '{"genetic": 0.9}'
+    result = disease_association_cross_check("FUS", pharos_notes, breakdown)
+    assert result.verdict == "partial"
+
+
+def test_disease_cross_check_incomparable_when_pharos_has_no_als_score():
+    """None / missing als_disgenet_score -> incomparable, not a fabricated
+    verdict. Real for a gene Pharos has no ALS entry for."""
+    result = disease_association_cross_check("GENE", "tdl=Tchem", '{"genetic": 0.9}')
+    assert result.verdict == "incomparable"
+
+
+def test_disease_cross_check_incomparable_when_no_otp_scores():
+    """No PriorityScore yet (scoring hasn't run) -> incomparable."""
+    pharos_notes = "als_disgenet_score=0.7"
+    result = disease_association_cross_check("GENE", pharos_notes, None)
+    assert result.verdict == "incomparable"
+
+
+def test_disease_cross_check_never_merges_values():
+    """Both pharos_value and pipeline_value are always separate strings —
+    never silently merged into a single number."""
+    result = disease_association_cross_check("SOD1", "als_disgenet_score=0.7",
+                                             '{"genetic": 0.99, "literature": 1.0}')
+    assert result.pharos_value != result.pipeline_value
+    assert "DisGeNET" in result.pharos_value
+    assert "Genetic" in result.pipeline_value
+
+
+# --- Signal E (PRIORITY): PPI cross-check vs STRING -------------------------
+
+def test_parse_partner_list_extracts_symbols():
+    notes = "high_confidence_partner_count=10; partners=SOD1, TARDBP, FUS"
+    partners = _parse_partner_list(notes, "partners")
+    assert partners == {"SOD1", "TARDBP", "FUS"}
+
+
+def test_ppi_cross_check_agree_when_high_overlap():
+    """Real expected case: STRING high-confidence partners are a subset of
+    Pharos's full STRINGDB set -> high overlap -> AGREE (reassuring)."""
+    pharos_notes = "ppi_stringdb_count=485; ppi_partners=TARDBP, C9orf72, FUS, CCS, SOD2"
+    string_notes = "high_confidence_partner_count=3; partners=TARDBP, C9orf72, FUS"
+    result = ppi_cross_check("SOD1", pharos_notes, string_notes)
+    assert result.check_type == "ppi"
+    assert result.verdict == "agree"
+    assert result.details["overlap"] == 3
+
+
+def test_ppi_cross_check_disagree_when_low_overlap():
+    """Low overlap (<20%) -> DISAGREE — a real, surprising divergence worth
+    flagging (the two STRINGDB-derived lists disagree on which partners exist)."""
+    pharos_notes = "ppi_stringdb_count=100; ppi_partners=AAA, BBB, CCC"
+    string_notes = "high_confidence_partner_count=10; partners=DDD, EEE, FFF, GGG, HHH, III, JJJ, KKK, LLL, MMM"
+    result = ppi_cross_check("GENE", pharos_notes, string_notes)
+    assert result.verdict == "disagree"
+
+
+def test_ppi_cross_check_partial_moderate_overlap():
+    pharos_notes = "ppi_stringdb_count=50; ppi_partners=AAA, BBB, CCC"
+    string_notes = "high_confidence_partner_count=10; partners=AAA, BBB, X1, X2, X3, X4, X5, X6, X7, X8"
+    result = ppi_cross_check("GENE", pharos_notes, string_notes)
+    assert result.verdict == "partial"  # 2/10 = 20%
+
+
+def test_ppi_cross_check_incomparable_when_either_source_empty():
+    """No partners in either source -> incomparable, not a fabricated verdict."""
+    result = ppi_cross_check("GENE", "ppi_stringdb_count=0; ppi_partners=none", None)
+    assert result.verdict == "incomparable"
+
+
+def test_ppi_cross_check_never_merges_values():
+    result = ppi_cross_check("SOD1",
+                             "ppi_stringdb_count=485; ppi_partners=TARDBP, FUS",
+                             "high_confidence_partner_count=2; partners=TARDBP, FUS")
+    assert "485" in result.pharos_value
+    assert "high-confidence" in result.pipeline_value
+    assert result.pharos_value != result.pipeline_value

@@ -59,6 +59,7 @@ import statistics
 from app.config import (
     DISEASE_EFO_ID, DISEASE_NAME, CANDIDATE_TARGETS, GENETIC_DATATYPE_ID,
     EXPRESSION_ATLAS_DATASOURCE_ID, PARALOGUE_MODALITY_NOTE_IDENTITY_THRESHOLD,
+    family_druggability_heuristic,
 )
 from app.db.database import SessionLocal, init_db
 from app.db.models import Target, EvidenceRecord, ContradictionLog, GapRecord, PriorityScore, PipelineRunLog
@@ -610,35 +611,60 @@ def _build_paralogy_fields(gene_symbol: str, paralog_row: dict) -> dict:
 
 def _build_druggability_fields(row: dict) -> dict:
     """
-    Real Pharos druggability characterization (Target Development Level — see
-    app/ingestion/pharos_client.py's docstring for the live-confirmed
-    endpoint and field semantics). ONE real row per gene (a single
-    druggability assessment per target, same "one aggregate fact per gene"
-    pattern as _build_essentiality_fields()), inserted only when Pharos
-    actually has the target — a gene Pharos doesn't recognize is a real
-    absence (the client returns None), never fabricated as a Tdark-default.
+    Real Pharos druggability characterization (see app/ingestion/pharos_client.py's
+    docstring for the live-confirmed endpoint and the FIVE distinct signals fetched
+    in one query). ONE real row per gene (a single druggability assessment per
+    target, same "one aggregate fact per gene" pattern as _build_essentiality_fields()),
+    inserted only when Pharos actually has the target — a gene Pharos doesn't
+    recognize is a real absence (the client returns None), never fabricated as a
+    Tdark-default.
+
+    FIVE SIGNALS stored here (items 1-3 of this task as EvidenceRecord fields
+    under dimension="druggability"; items 4-5's RAW DATA is also stored here
+    for the cross-check module, since it's all Pharos-derived — the cross-check
+    RESULTS themselves are computed separately in app/core/verification/
+    pharos_cross_checks.py, NOT as a new EvidenceRecord dimension):
+      1. TDL -> raw_value (via score_druggability_tdl()); novelty -> notes
+         (its own field, separate from TDL — under-studied-relative-to-importance,
+         NOT the same as TDL: a target can be low-novelty yet Tdark).
+      2. fam -> notes + the prototype family-druggability heuristic label
+         (config.family_druggability_heuristic, documented as a prototype).
+      3. Ligand/drug activity detail -> notes: aggregate ligand_count/drug_count
+         (exhaustive, from ligandCounts) PLUS a bounded per-ligand sample with
+         isdrug + activity type/value (not just a count).
+      4. ALS disease association -> notes: Pharos DisGeNET score + PubMed/SNP
+         evidence + gene-specific ALS subtype (raw input for the disease-
+         association cross-check vs OTP Genetic/Literature).
+      5. PPI -> notes: Pharos STRINGDB partner count + bounded partner symbol
+         list (raw input for the PPI cross-check vs STRING).
 
     DELIBERATELY NOT SCORED INTO evidence_score (same design question as
     safety_signal/essentiality_risk/paralogy, answered the same way):
     `evidence_score` is left None on purpose, and the TDL score lives in
-    `raw_value` instead (via score_druggability_tdl()). This guarantees
-    druggability can NEVER be silently averaged into
-    evidence_strength/dimension_breakdown/evidence_maturity (app/api/routes/
-    scoring.py only aggregates records whose evidence_score is non-null) or
-    picked as the maturity rung ("druggability" is deliberately NOT a key in
-    config.DIMENSION_MATURITY_LADDER). Druggability is a target PROPERTY, not
-    translational evidence — surfaced instead via its own gap type
-    (gap_taxonomy "druggability", fires on Tdark) and translational_opportunity
-    (Tdark -> Early-Stage Discovery, Tclin reinforces Clinical-Stage). The
-    "ALONGSIDE the existing OTP-based scoring, not replacing it" framing is
-    enforced structurally here, not just by convention.
-
-    Supporting fields (per this task's instruction to "store novelty score and
-    ligand count as supporting fields") all go into `notes`: novelty, family,
-    ligand_count, drug_count, publication_count, and the real target name —
-    real values straight from Pharos, never defaulted.
+    `raw_value` instead. This guarantees druggability can NEVER be silently
+    averaged into evidence_strength/dimension_breakdown/evidence_maturity
+    (app/api/routes/scoring.py only aggregates records whose evidence_score is
+    non-null) or picked as the maturity rung ("druggability" is deliberately
+    NOT a key in config.DIMENSION_MATURITY_LADDER). Druggability is a target
+    PROPERTY, not translational evidence — surfaced instead via its own gap
+    type (gap_taxonomy "druggability", fires on Tdark) and
+    translational_opportunity (Tdark -> Early-Stage Discovery, Tclin
+    reinforces Clinical-Stage). The "ALONGSIDE the existing OTP-based scoring,
+    not replacing it" framing is enforced structurally here, not just by
+    convention.
     """
     tdl = row.get("tdl")
+    fam = row.get("fam")
+    fam_label = family_druggability_heuristic(fam)
+    als = row.get("als_association") or {}
+    ppi = row.get("ppi") or {}
+    # Bounded per-ligand activity detail (Signal C) — compact, parseable.
+    ligand_samples = row.get("ligands") or []
+    ligand_detail = "; ".join(
+        f"{lig['name']} (isdrug={lig['isdrug']}, actcnt={lig['actcnt']}, "
+        f"activities={_format_ligand_activities(lig['activities'])})"
+        for lig in ligand_samples
+    ) or "none"
     return dict(
         dimension="druggability",
         data_source="pharos",
@@ -648,10 +674,27 @@ def _build_druggability_fields(row: dict) -> dict:
         evidence_score=None,
         external_id=row.get("name"),
         notes=(
-            f"tdl={tdl}; name={row.get('name')}; family={row.get('fam')}; "
-            f"novelty={row.get('novelty')}; ligand_count={row.get('ligand_count')}; "
-            f"drug_count={row.get('drug_count')}; publication_count={row.get('publication_count')}"
+            f"tdl={tdl}; name={row.get('name')}; family={fam}; "
+            f"family_druggability_heuristic={fam_label}; "
+            f"novelty={row.get('novelty')}; publication_count={row.get('publication_count')}; "
+            f"ligand_count={row.get('ligand_count')}; drug_count={row.get('drug_count')}; "
+            f"ligand_detail={ligand_detail}; "
+            f"als_disgenet_score={als.get('disgenet_score')}; "
+            f"als_evidence={als.get('evidence')}; als_subtype={als.get('subtype')}; "
+            f"ppi_stringdb_count={ppi.get('stringdb_count')}; "
+            f"ppi_total_count={ppi.get('total_count')}; "
+            f"ppi_partners={', '.join(ppi.get('partner_symbols') or []) or 'none'}"
         ),
+    )
+
+
+def _format_ligand_activities(activities: list) -> str:
+    """Compact one-line summary of a ligand's activities: 'EC50=7.17, IC50=6.5'."""
+    if not activities:
+        return "none"
+    return ", ".join(
+        f"{a.get('type')}={a.get('value')}" for a in activities
+        if isinstance(a, dict) and a.get("type")
     )
 
 

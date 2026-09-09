@@ -154,6 +154,35 @@ class PriorityScoreOut(BaseModel):
         from_attributes = True
 
 
+class CrossCheckOut(BaseModel):
+    """
+    One Pharos-vs-pipeline cross-check result (items D and E of the Pharos
+    expansion — see app/core/verification/pharos_cross_checks.py). A
+    COMPARISON of two independent sources' read on the same target, NOT new
+    evidence and NOT a new EvidenceRecord dimension. Both `pharos_value` and
+    `pipeline_value` are always present and visible — never silently merged
+    into a single number, per the design discipline this project follows
+    for every cross-check (same pattern as GTEx-vs-HPA).
+    """
+    check_type: str  # "disease_association" | "ppi"
+    gene_symbol: str
+    verdict: str  # "agree" | "disagree" | "partial" | "incomparable"
+    pharos_value: str
+    pipeline_value: str
+    rationale: str
+    details: dict
+
+    class Config:
+        from_attributes = True
+
+
+class PharosCrossChecksOut(BaseModel):
+    """Both Pharos cross-checks (disease-association + PPI) for one target."""
+    target_id: int
+    gene_symbol: str
+    cross_checks: list[CrossCheckOut]
+
+
 class MomentumOut(BaseModel):
     """
     Evidence Momentum / Trend Signal — see

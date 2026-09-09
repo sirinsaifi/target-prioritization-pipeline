@@ -121,6 +121,51 @@ TDL_SCORES = {
     "Tdark": 0.1,
 }
 
+# --- Protein family druggability heuristic (Signal B) ---
+#
+# PROTOTYPE HEURISTIC, not established science — documented the same as every
+# other threshold in this file. Pharos's `fam` field gives a target's protein
+# family (Enzyme, Kinase, GPCR, Ion Channel, Transcription Factor, ...). Some
+# families have historically strong small-molecule druggability track records
+# (kinases, GPCRs, ion channels, enzymes) vs. traditionally harder ones
+# (transcription factors, nuclear receptors are mixed). This is a coarse,
+# documented judgment call surfacing family as CONTEXT alongside TDL — it
+# NEVER overrides TDL or the priority score, and a family's historical
+# tractability is no guarantee a SPECIFIC target in it is druggable.
+#
+# Values: "favorable" / "challenging" / "neutral" (neutral = not in either
+# list, or fam is null — 3 of the 5 real ALS genes return fam=null). Real
+# ALS-gene families: SOD1=Enzyme (favorable), NEK1=Kinase (favorable),
+# C9orf72/TARDBP/FUS=fam=null (neutral).
+DRUGGABLE_FAMILIES_FAVORABLE = {
+    "kinase", "gpcr", "g-protein coupled receptor", "ion channel",
+    "enzyme", "protease", "phosphatase", "histone deacetylase",
+}
+DRUGGABLE_FAMILIES_CHALLENGING = {
+    "transcription factor", "nuclear receptor",
+}
+
+
+def family_druggability_heuristic(fam: str | None) -> str:
+    """
+    Prototype family->druggability-favorability label (Signal B). Returns
+    'favorable' | 'challenging' | 'neutral'. Coarse heuristic over Pharos's
+    real `fam` field, documented as a prototype not established science —
+    see DRUGGABLE_FAMILIES_FAVORABLE/CHALLENGING above. None fam -> 'neutral'
+    (3 of 5 real ALS genes have fam=null; a real absence, not 'challenging').
+    Case-insensitive substring match against the family name.
+    """
+    if not fam:
+        return "neutral"
+    fam_lower = fam.lower()
+    for f in DRUGGABLE_FAMILIES_CHALLENGING:
+        if f in fam_lower:
+            return "challenging"
+    for f in DRUGGABLE_FAMILIES_FAVORABLE:
+        if f in fam_lower:
+            return "favorable"
+    return "neutral"
+
 # Dimensions whose real evidence_score has a KNOWN scoring-FORMULA
 # limitation that can make a real, meaningful result look artificially
 # weak — distinct from a dimension simply having low real evidence. Found
