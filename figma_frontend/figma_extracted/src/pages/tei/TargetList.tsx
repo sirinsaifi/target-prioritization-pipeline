@@ -85,7 +85,7 @@ export default function TargetList({ targets, onSelectTarget }: Props) {
           Candidate Targets
         </h1>
         <p style={{ fontSize: 13.5, color: 'var(--ink-2)', margin: 0 }}>
-          {targets.length} targets evaluated for <strong>Amyotrophic Lateral Sclerosis (ALS)</strong>. Click a row to open Target Detail.
+          {targets.length} targets evaluated for current disease indication. Click a row to open Target Detail.
         </p>
       </div>
 

@@ -189,10 +189,10 @@ export default function App() {
               padding: '4px 28px 4px 10px', background: 'var(--page-bg)',
               appearance: 'none', cursor: 'pointer', outline: 'none',
             }}>
-              <option>Amyotrophic Lateral Sclerosis (ALS)</option>
-              <option>Parkinson's Disease</option>
-              <option>Alzheimer's Disease</option>
-              <option>Huntington's Disease</option>
+              <option value="EFO_0000253">Amyotrophic Lateral Sclerosis (ALS)</option>
+              <option value="EFO_0000508">Cystic Fibrosis</option>
+              <option value="EFO_0000647">Parkinson's Disease</option>
+              <option value="EFO_0000685">Rheumatoid Arthritis</option>
             </select>
           </div>
           <div style={{ flex: 1 }} />

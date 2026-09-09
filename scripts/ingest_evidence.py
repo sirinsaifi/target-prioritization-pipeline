@@ -100,10 +100,13 @@ DATASOURCE_TO_DIMENSION = {
     "europepmc": "literature",
     "clinical_precedence": "human_clinical",
     "impc": "experimental",
-    # Omics (Expression Atlas) is confirmed largely retired at the source
-    # (recovered real data exactly once across ALS, CF, and RA testing
-    # (PTPN22)). It is removed from the active pipeline to avoid wasteful
-    # API calls, but kept as a builder for potential re-enablement.
+    # Omics (Expression Atlas): confirmed largely retired at the source;
+    # recovered real data exactly once across all multi-disease testing
+    # (PTPN22/Rheumatoid Arthritis). Not called by default — removed from
+    # the active pipeline to avoid wasteful API calls with a near-zero real
+    # success rate. The builder (_build_omics_fields) and scorer
+    # (score_omics_expression) are kept available for re-enablement if the
+    # datasource is ever restored upstream.
     # EXPRESSION_ATLAS_DATASOURCE_ID: "omics",
 }
 
