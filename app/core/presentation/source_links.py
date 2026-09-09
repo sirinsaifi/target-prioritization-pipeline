@@ -154,6 +154,23 @@ def get_source_url(
         # that's the actual subject of this record.
         return f"https://www.ensembl.org/Homo_sapiens/Gene/Summary?g={external_id}" if external_id else None
 
+    if data_source == "pharos":
+        # `source_record_id` carries the real gene symbol (pharos:{SYM}) —
+        # links to the real Pharos target page for this gene. Live-tested:
+        # https://pharos.nih.gov/targets/SOD1 -> 200 (the web UI; the API
+        # itself lives at pharos-api.ncats.io — see pharos_client.py).
+        sym = source_record_id.split(":", 1)[1] if source_record_id and ":" in source_record_id else None
+        return f"https://pharos.nih.gov/targets/{sym}" if sym else None
+
+    if data_source == "google_patents":
+        # `source_record_id` carries the real gene symbol (google_patents:{SYM})
+        # — links to a real Google Patents search for that gene. Live-tested:
+        # https://patents.google.com/?q=SOD1 -> 200. The XHR JSON API the
+        # client uses is undocumented, but the public search page this links
+        # to is the stable, user-facing URL.
+        sym = source_record_id.split(":", 1)[1] if source_record_id and ":" in source_record_id else None
+        return f"https://patents.google.com/?q={sym}" if sym else None
+
     # orphanet, impc, and anything else not listed above: no real per-record
     # external id exists in this pipeline's data — see module docstring.
     return None

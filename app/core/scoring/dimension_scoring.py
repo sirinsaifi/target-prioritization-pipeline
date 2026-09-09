@@ -17,7 +17,7 @@ import math
 from app.config import (
     L2G_INCLUSION_THRESHOLD, TRIAL_STOPPED_EARLY_WEIGHT,
     OMICS_LOG2FC_SIGNIFICANCE_THRESHOLD, OMICS_PVALUE_SIGNIFICANCE_THRESHOLD,
-    TISSUE_SPECIFICITY_SCORES, PPI_HUB_SCORE_CEILING,
+    TISSUE_SPECIFICITY_SCORES, PPI_HUB_SCORE_CEILING, TDL_SCORES,
 )
 
 
@@ -311,6 +311,44 @@ def score_ppi_hub(high_confidence_partner_count: int) -> float:
     return round(min(max(high_confidence_partner_count, 0) / PPI_HUB_SCORE_CEILING, 1.0), 4)
 
 
+def score_druggability_tdl(tdl: str | None) -> float | None:
+    """
+    Druggability dimension — Pharos Target Development Level (TDL), an
+    independent signal from Open Targets (see app/ingestion/pharos_client.py's
+    docstring for the live-confirmed field semantics and why this is the
+    project's first real druggability source — OTP's own prioritisation
+    factors deliberately exclude every structural/druggability factor).
+
+    PROTOTYPE mapping (per this task's own instruction, documented as a
+    prototype the same as every other threshold in this project — NOT an
+    externally published scale): Tclin=1.0, Tchem=0.7, Tbio=0.4, Tdark=0.1.
+    These reflect Pharos's own ordinal druggability tiers (Tclin targets have
+    approved drugs; Tdark targets have almost no known ligands/drugs), mapped
+    to a 0-1 scale for this project's own ranking convenience.
+
+    IMPORTANT — KEPT OUT OF THE OTP-BASED PRIORITY SCORE: the returned score
+    is stored in EvidenceRecord.raw_value, NOT evidence_score (which is left
+    None — see scripts/ingest_evidence.py's _build_druggability_fields()
+    docstring). This guarantees druggability can NEVER be silently averaged
+    into evidence_strength/dimension_breakdown/evidence_maturity (scoring.py
+    only aggregates records whose evidence_score is non-null), exactly the
+    same structural mechanism safety_signal/essentiality_risk/paralogy already
+    use — druggability is a target PROPERTY, not translational evidence, and
+    is surfaced instead via its own gap type (gap_taxonomy "druggability") and
+    translational_opportunity (Tdark -> Early-Stage Discovery, Tclin
+    reinforces Clinical-Stage). This function exists so the mapping is a
+    single named, testable, deterministic rule rather than inlined in the
+    ingestion builder.
+
+    Returns None for an unrecognized/missing TDL — a real absence of signal,
+    not a fabricated 0.0 (Pharos always returns one of the four real tiers
+    for a found target, so None here means the target itself wasn't found).
+    """
+    if not tdl:
+        return None
+    return TDL_SCORES.get(tdl.strip())
+
+
 DIMENSION_SCORERS = {
     "genetic": score_genetic_l2g,
     "literature": score_literature_cooccurrence,
@@ -321,4 +359,11 @@ DIMENSION_SCORERS = {
     "drug_target": score_drug_target,
     "tissue_expression": score_tissue_specificity,
     "ppi_network": score_ppi_hub,
+    # NOTE: "druggability" and "competitive_position" are deliberately
+    # ABSENT from this dict. Both are independent context signals kept out of
+    # the OTP-based priority_score (see score_druggability_tdl()'s docstring
+    # and _build_competitive_position_fields()'s) — their scores live in
+    # raw_value with evidence_score=None, so scoring.py never aggregates them.
+    # Registering them here would imply they flow through the same
+    # harmonic-sum strength path as real evidence, which they must not.
 }

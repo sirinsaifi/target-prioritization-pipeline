@@ -89,6 +89,16 @@ class TargetEvidenceSummary:
     # what the Modality gap is about. This never changes whether the
     # Modality gap fires, only what it says when it does.
     paralogue_high_identity_matches: list = field(default_factory=list)
+    # New (this task). Real Pharos Target Development Level (TDL) — the real
+    # tier string ("Tclin" | "Tchem" | "Tbio" | "Tdark") straight from
+    # pharos-api.ncats.io (see app/ingestion/pharos_client.py). Drives the
+    # new "druggability" gap below: a target with strong OTP evidence but
+    # TDL=Tdark (Pharos's own "almost nothing is known about how to drug
+    # this target" tier) warrants a Druggability Gap — biology says this
+    # target matters, but the druggability picture is essentially blank.
+    # None means Pharos had no target for this gene (a real absence, not a
+    # Tdark default — see _build_druggability_fields()'s docstring).
+    tdl: str | None = None
     # New (this task — "fully actionable gap" decision-layer feature). Real
     # per-pair field-VALUE detail behind each population_heterogeneity
     # contradiction (e.g. "population: 'european' vs 'east_asian' (eva vs
@@ -199,6 +209,25 @@ GAP_TEMPLATES = {
                           "automatically disqualify {gene}; suggest weighing the real modality actually "
                           "being considered (knockdown vs. full knockout) before treating this as "
                           "prohibitive.",
+    # New (this task). Distinct from modality ("no known compound in our data
+    # sources") and from drug_target ("is there a clinical-stage drug"):
+    # druggability is about the target's BIOLOGICAL tractability to ANY
+    # intervention — a Tdark target has almost no known ligands, pockets, or
+    # druggability characterization at all (Pharos's own bottom tier), which
+    # is a deeper, earlier-stage obstacle than "no compound found yet" (which
+    # could just be a data-coverage gap — see modality's template above).
+    # Gated on high evidence strength, same pattern as safety_signal/
+    # essentiality_risk/modality: a target that isn't being prioritized on
+    # its merits doesn't need a druggability-priority tension flagged.
+    "druggability": "{gene} shows strong evidence support, but Pharos classifies it as Tdark — the "
+                    "lowest druggability tier, meaning almost nothing is known about how to drug this "
+                    "target (few or no known ligands, pockets, or active-site characterization). This is "
+                    "distinct from simply having no known compound yet (see the modality gap): it indicates "
+                    "the target's biological tractability to ANY small-molecule or ligand-based intervention "
+                    "is essentially uncharacterized. Suggest early druggability assessment (structural "
+                    "biology, pocket detection, ligand screening) before assuming a conventional "
+                    "small-molecule or biologic approach is feasible — an RNA-targeted or gene-therapy "
+                    "modality may be the more realistic path.",
 }
 
 
@@ -234,6 +263,10 @@ WHY_IT_MATTERS = {
                           "real, if not directly transferable, caution about whether strongly "
                           "inhibiting or fully eliminating {gene}'s function could harm healthy "
                           "cells.",
+    "druggability": "A target with strong disease-association evidence but no characterized "
+                    "druggability (Tdark) carries a real translational risk: even if the biology "
+                    "is convincing, the project may discover there is no practical chemistry "
+                    "starting point for a conventional therapeutic modality against {gene}.",
 }
 
 DECISION_IMPACT = {
@@ -254,6 +287,9 @@ DECISION_IMPACT = {
     "essentiality_risk": "Favor a partial-modulation modality (e.g. knockdown) over full "
                           "knockout/loss-of-function approaches for {gene} until tissue-specific "
                           "safety is better understood.",
+    "druggability": "May require a non-conventional modality (RNA-targeted, gene therapy, "
+                    "PROTAC) or upstream druggability discovery work before {gene} can be "
+                    "advanced with a standard small-molecule or ligand-based approach.",
 }
 
 
@@ -423,6 +459,30 @@ def identify_gaps(summary: TargetEvidenceSummary,
             GAP_TEMPLATES["essentiality_risk"].format(gene=g, note=note),
             WHY_IT_MATTERS["essentiality_risk"].format(gene=g),
             DECISION_IMPACT["essentiality_risk"].format(gene=g),
+        ))
+
+    # 8. Druggability gap (this task). Gated on high evidence strength, same
+    # pattern as safety_signal/essentiality_risk/modality above — the
+    # finding this gap exists to surface is the tension between "biology
+    # says this target matters" and "almost nothing is known about how to
+    # drug it". Fires ONLY on Tdark (Pharos's own bottom tier: few or no
+    # known ligands/pockets/active-site characterization) — Tchem/Tbio/Tclin
+    # all have at least some druggability characterization and do NOT
+    # trigger this gap. Like safety_signal/essentiality_risk, this fires
+    # because a real fact EXISTS (a Tdark classification), not because
+    # evidence is missing — distinct from modality ("no known compound in
+    # our data sources", which could be a data-coverage gap) and from
+    # drug_target ("no clinical-stage drug"): Tdark is a deeper, earlier-
+    # stage obstacle about the target's biological tractability to ANY
+    # intervention, not about whether a specific compound has been found.
+    if summary.evidence_strength >= strength_high_threshold and summary.tdl == "Tdark":
+        findings.append(GapFinding(
+            "druggability",
+            f"Evidence strength {summary.evidence_strength:.2f} >= {strength_high_threshold} "
+            f"but {g} is Pharos Tdark (lowest druggability tier — almost no known ligands/pockets).",
+            GAP_TEMPLATES["druggability"].format(gene=g),
+            WHY_IT_MATTERS["druggability"].format(gene=g),
+            DECISION_IMPACT["druggability"].format(gene=g),
         ))
 
     return findings

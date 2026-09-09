@@ -3,3 +3,17 @@ venv/
 __pycache__/
 *.pyc
 als_pipeline.db
+node_modules
+.claude
+.pytest_cache
+node_modules/
+dist/
+build/
+.cache/
+.env*
+.vite/
+vite.config.*.timestamp-*
+*.tsbuildinfo
+*-debug.log*
+.claude-replay.*
+.tmp-*

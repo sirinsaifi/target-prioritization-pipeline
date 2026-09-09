@@ -71,6 +71,7 @@ from app.ingestion.clinicaltrials_gov_client import get_clinical_trials
 from app.ingestion.hpa_client import get_tissue_expression
 from app.ingestion.gtex_client import get_median_tissue_expression
 from app.ingestion.string_client import get_ppi_partners, get_string_id
+from app.ingestion.pharos_client import get_druggability_evidence
 from app.core.scoring.dimension_scoring import (
     score_genetic_l2g,
     score_clinical_precedence,
@@ -81,6 +82,7 @@ from app.core.scoring.dimension_scoring import (
     score_drug_target,
     score_tissue_specificity,
     score_ppi_hub,
+    score_druggability_tdl,
     compute_tau_specificity,
 )
 
@@ -606,6 +608,53 @@ def _build_paralogy_fields(gene_symbol: str, paralog_row: dict) -> dict:
     )
 
 
+def _build_druggability_fields(row: dict) -> dict:
+    """
+    Real Pharos druggability characterization (Target Development Level — see
+    app/ingestion/pharos_client.py's docstring for the live-confirmed
+    endpoint and field semantics). ONE real row per gene (a single
+    druggability assessment per target, same "one aggregate fact per gene"
+    pattern as _build_essentiality_fields()), inserted only when Pharos
+    actually has the target — a gene Pharos doesn't recognize is a real
+    absence (the client returns None), never fabricated as a Tdark-default.
+
+    DELIBERATELY NOT SCORED INTO evidence_score (same design question as
+    safety_signal/essentiality_risk/paralogy, answered the same way):
+    `evidence_score` is left None on purpose, and the TDL score lives in
+    `raw_value` instead (via score_druggability_tdl()). This guarantees
+    druggability can NEVER be silently averaged into
+    evidence_strength/dimension_breakdown/evidence_maturity (app/api/routes/
+    scoring.py only aggregates records whose evidence_score is non-null) or
+    picked as the maturity rung ("druggability" is deliberately NOT a key in
+    config.DIMENSION_MATURITY_LADDER). Druggability is a target PROPERTY, not
+    translational evidence — surfaced instead via its own gap type
+    (gap_taxonomy "druggability", fires on Tdark) and translational_opportunity
+    (Tdark -> Early-Stage Discovery, Tclin reinforces Clinical-Stage). The
+    "ALONGSIDE the existing OTP-based scoring, not replacing it" framing is
+    enforced structurally here, not just by convention.
+
+    Supporting fields (per this task's instruction to "store novelty score and
+    ligand count as supporting fields") all go into `notes`: novelty, family,
+    ligand_count, drug_count, publication_count, and the real target name —
+    real values straight from Pharos, never defaulted.
+    """
+    tdl = row.get("tdl")
+    return dict(
+        dimension="druggability",
+        data_source="pharos",
+        source_type="druggability",
+        source_record_id=f"pharos:{row.get('sym') or row.get('name')}",
+        raw_value=score_druggability_tdl(tdl),
+        evidence_score=None,
+        external_id=row.get("name"),
+        notes=(
+            f"tdl={tdl}; name={row.get('name')}; family={row.get('fam')}; "
+            f"novelty={row.get('novelty')}; ligand_count={row.get('ligand_count')}; "
+            f"drug_count={row.get('drug_count')}; publication_count={row.get('publication_count')}"
+        ),
+    )
+
+
 _FIELD_BUILDERS = {
     "genetic": _build_genetic_fields,
     "literature": _build_literature_fields,
@@ -1058,6 +1107,31 @@ def ingest_target(db, gene_symbol: str, ensembl_id: str) -> int:
         if _save_evidence(db, record, gene_symbol, "string"):
             saved += 1
             print(f"  [{gene_symbol}] string: 1 row ingested ({len(ppi_partners)} real high-confidence partners)")
+
+    # Druggability: real Pharos Target Development Level (TDL) — a genuinely
+    # independent external source (NOT Open Targets — see
+    # app/ingestion/pharos_client.py docstring for the live-confirmed
+    # endpoint pharos-api.ncats.io/graphql, NOT pharos.nih.gov/api which
+    # 403s). Same graceful error-handling convention as every other real
+    # external API call here: log and continue, never abort. A real query
+    # failure is NOT the same as a real confirmed "Pharos has no target"
+    # (the client returns None for a not-found symbol) — a failed query
+    # skips the row entirely so an API timeout never fabricates a missing-
+    # druggability finding, exactly like the PPI failure path above.
+    try:
+        pharos_row = get_druggability_evidence(gene_symbol)
+    except Exception as exc:
+        print(f"  [{gene_symbol}] pharos: query failed ({exc}), skipping")
+        pharos_row = None
+    if pharos_row is not None:
+        record = EvidenceRecord(target_id=target.id, **_build_druggability_fields(pharos_row))
+        if _save_evidence(db, record, gene_symbol, "pharos"):
+            saved += 1
+            print(f"  [{gene_symbol}] pharos: 1 row ingested (tdl={pharos_row['tdl']}, "
+                  f"family={pharos_row['fam']}, ligands={pharos_row['ligand_count']}, "
+                  f"drugs={pharos_row['drug_count']})")
+    else:
+        print(f"  [{gene_symbol}] pharos: 0 rows ingested (no real Pharos target for this gene)")
 
     return saved
 

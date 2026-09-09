@@ -89,6 +89,23 @@ def _gather_target_evidence_flags(db: Session, target_id: int) -> dict:
         f"{r.notes.split('paralog_gene=')[1].split(';')[0]} ({r.raw_value:.1f}% identity)"
         for r in paralogy_records if r.notes and "paralog_gene=" in r.notes
     ]
+    # Real Pharos Target Development Level (TDL) — read from the
+    # druggability row's notes (format "tdl=Tchem; name=...; ..." — see
+    # scripts/ingest_evidence.py's _build_druggability_fields()). None if
+    # Pharos had no target for this gene (a real absence, never defaulted
+    # to Tdark). Same notes-parsing convention already used above for
+    # safety_signal_events ("event=...") and paralogue_high_identity_matches
+    # ("paralog_gene=...").
+    druggability_record = db.query(EvidenceRecord).filter_by(
+        target_id=target_id, dimension="druggability",
+    ).first()
+    tdl = None
+    if druggability_record and druggability_record.notes:
+        for part in druggability_record.notes.split(";"):
+            part = part.strip()
+            if part.startswith("tdl="):
+                tdl = part.removeprefix("tdl=") or None
+                break
 
     return dict(
         has_pathway_evidence=has_pathway_evidence,
@@ -100,6 +117,7 @@ def _gather_target_evidence_flags(db: Session, target_id: int) -> dict:
         has_essentiality_risk=has_essentiality_risk,
         essentiality_risk_note=essentiality_risk_note,
         paralogue_high_identity_matches=paralogue_high_identity_matches,
+        tdl=tdl,
     )
 
 
@@ -125,6 +143,7 @@ def _build_translational_opportunity(gene_symbol: str, priority, gap_types: list
         has_essentiality_risk=flags["has_essentiality_risk"],
         essentiality_risk_note=flags["essentiality_risk_note"],
         open_evidence_gap_types=open_evidence_gap_types,
+        tdl=flags["tdl"],
     )
     return classify_translational_opportunity(opportunity_input)
 
@@ -214,6 +233,7 @@ def run_gap_analysis(target_id: int, db: Session = Depends(get_db)):
         essentiality_risk_note=flags["essentiality_risk_note"],
         paralogue_high_identity_matches=flags["paralogue_high_identity_matches"],
         population_heterogeneity_details=population_heterogeneity_details,
+        tdl=flags["tdl"],
     )
 
     findings = identify_gaps(

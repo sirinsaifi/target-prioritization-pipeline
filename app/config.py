@@ -97,6 +97,30 @@ STRING_HIGH_CONFIDENCE_THRESHOLD = 700
 # externally published reference — a documented judgment call.
 PPI_HUB_SCORE_CEILING = 100
 
+# --- Druggability (Pharos) ---
+#
+# New independent signal (this task) — Pharos Target Development Level (TDL),
+# from pharos-api.ncats.io (see app/ingestion/pharos_client.py's docstring for
+# the live-confirmed endpoint and field semantics). PROTOTYPE 0-1 mapping of
+# Pharos's own ordinal tiers, documented the same as every other threshold in
+# this file — NOT an externally published scale. Tclin targets have approved
+# drugs (Pharos's own top tier); Tdark targets have almost no known
+# ligands/drugs (Pharos's own bottom tier). Tchem/Tbio sit between.
+#
+# REAL, LIVE-CONFIRMED FINDING across the 5 ALS candidates: NONE are Tclin or
+# Tdark (SOD1/TARDBP/NEK1 = Tchem, C9orf72/FUS = Tbio) — so the Druggability
+# Gap (gap_taxonomy "druggability", fires on Tdark) and the Tdark ->
+# Early-Stage Discovery translational rule are real and unit-tested but NOT
+# exercised by any of today's real genes, same "real but currently
+# unexercised" status as several other features in this project. State this
+# honestly in the report rather than implying a Tdark case was found.
+TDL_SCORES = {
+    "Tclin": 1.0,
+    "Tchem": 0.7,
+    "Tbio": 0.4,
+    "Tdark": 0.1,
+}
+
 # Dimensions whose real evidence_score has a KNOWN scoring-FORMULA
 # limitation that can make a real, meaningful result look artificially
 # weak — distinct from a dimension simply having low real evidence. Found
@@ -315,6 +339,27 @@ COMPARABILITY_FIELDS_BY_SOURCE_TYPE = {
     # scripts/ingest_evidence.py's _build_paralogy_fields() docstring), not
     # genetic evidence of disease association.
     "paralogy": [],
+    # New (this task). Real Pharos Target Development Level (TDL) — an
+    # independent druggability signal from pharos-api.ncats.io (NOT Open
+    # Targets at all). Confirmed via live introspection that the Pharos
+    # Target type carries NO tissue/population/assay_type/direction_on_trait
+    # fields — a gene-level target property, not a disease-association claim,
+    # so it's structurally excluded from contradiction classification for the
+    # same reason as pathway/ppi_network/paralogy above. Deliberately NOT
+    # scored into evidence_score (see dimension_scoring.score_druggability_tdl()
+    # docstring): druggability is a target PROPERTY, not translational
+    # evidence, surfaced instead via its own gap type + translational_opportunity.
+    "druggability": [],
+    # New (this task). Real Google Patents landscape data (competitive
+    # position) — see app/ingestion/patent_client.py. A gene-level aggregate
+    # (one row per gene: total patent count, filing-year range, top
+    # assignees), not a disease-association claim — structurally excluded
+    # from contradiction classification for the same reason as the other
+    # context signals above. Deliberately NOT a strength score: high patent
+    # activity = HIGH competition (a caution/context signal), never silently
+    # merged into priority_score as if more patents = better (same treatment
+    # as safety_signal/essentiality_risk).
+    "competitive_position": [],
 }
 
 # Real Open Targets Target Prioritisation Factor threshold for Paralogues
@@ -409,6 +454,17 @@ SOURCE_TYPE_BY_DATA_SOURCE = {
     # these two simple, non-structural OTP fields are queried.
     "ot_essentiality": "essentiality_risk",
     "ot_paralogy": "paralogy",
+    # New (this task). Real Pharos druggability data from
+    # pharos-api.ncats.io/graphql (NOT an OTP datasource — see
+    # app/ingestion/pharos_client.py). Maps to the "druggability" source-type
+    # group above (no comparability fields — a gene-level target property,
+    # structurally excluded from contradiction classification).
+    "pharos": "druggability",
+    # New (this task). Real Google Patents landscape data (competitive
+    # position) — see app/ingestion/patent_client.py. Maps to the
+    # "competitive_position" source-type group above (no comparability
+    # fields — a gene-level aggregate, not a disease-association claim).
+    "google_patents": "competitive_position",
 }
 
 # Deprecated: kept only for backward compatibility with earlier prototype

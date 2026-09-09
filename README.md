@@ -53,7 +53,7 @@ tests/                             Unit tests for scoring + classifier logic
 ## Setup
 
 ```bash
-python -m venv venv
+python -m venv venv¡
 source venv/bin/activate
 pip install -r requirements.txt
 uvicorn app.main:app --reload
