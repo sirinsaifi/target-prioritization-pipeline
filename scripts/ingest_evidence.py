@@ -100,10 +100,11 @@ DATASOURCE_TO_DIMENSION = {
     "europepmc": "literature",
     "clinical_precedence": "human_clinical",
     "impc": "experimental",
-    # New (this task). Real, confirmed-in-schema datasourceId — see
-    # config.EXPRESSION_ATLAS_DATASOURCE_ID's docstring for why this
-    # returns zero real rows for every gene in this project's actual data.
-    EXPRESSION_ATLAS_DATASOURCE_ID: "omics",
+    # Omics (Expression Atlas) is confirmed largely retired at the source
+    # (recovered real data exactly once across ALS, CF, and RA testing
+    # (PTPN22)). It is removed from the active pipeline to avoid wasteful
+    # API calls, but kept as a builder for potential re-enablement.
+    # EXPRESSION_ATLAS_DATASOURCE_ID: "omics",
 }
 
 DIMENSION_TO_SOURCE_TYPE = {

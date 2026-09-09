@@ -180,11 +180,13 @@ def score_omics_expression(log2_fold_change: float | None, p_value_mantissa: flo
     NEVER EXERCISED BY REAL DATA in this project — confirmed via live
     introspection that `expression_atlas` returns zero rows for all 5 ALS
     candidate genes and 2 additional well-studied cancer gene/disease pairs
-    (see config.EXPRESSION_ATLAS_DATASOURCE_ID). Built correctly against
-    the real, schema-confirmed field names anyway (log2FoldChangeValue,
-    log2FoldChangePercentileRank, pValueMantissa, pValueExponent), per this
-    task's instruction to confirm real fields before building — a real,
-    reportable absence of data, not a reason to skip building the formula.
+    (see config.EXPRESSION_ATLAS_DATASOURCE_ID). Confirmed largely retired at
+    the source; recovered real data exactly once across ALS, CF, and RA
+    testing (PTPN22). Built correctly against the real, schema-confirmed
+    field names anyway (log2FoldChangeValue, log2FoldChangePercentileRank,
+    pValueMantissa, pValueExponent), per this task's instruction to confirm
+    real fields before building — a real, reportable absence of data, not a
+    reason to skip building the formula.
     """
     if log2_fold_change is None or p_value_mantissa is None or p_value_exponent is None or percentile_rank is None:
         return None
