@@ -1,10 +1,11 @@
 from fastapi import APIRouter, Depends
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
-from app.db.models import Target
+from app.db.models import PipelineRunLog, Target
 from app.models.schemas import TargetOut
-from app.config import CANDIDATE_TARGETS, DISEASE_EFO_ID
+from app.config import CANDIDATE_TARGETS, DISEASE_EFO_ID, DISEASE_NAME
 
 router = APIRouter(prefix="/targets", tags=["targets"])
 
@@ -13,6 +14,18 @@ router = APIRouter(prefix="/targets", tags=["targets"])
 def list_targets(db: Session = Depends(get_db)):
     """Return all candidate targets currently loaded for the configured disease."""
     return db.query(Target).all()
+
+
+@router.get("/context")
+def get_context(db: Session = Depends(get_db)):
+    """Return the active disease context and latest persisted analysis timestamp."""
+    latest_analysis = db.query(func.max(PipelineRunLog.run_at)).scalar_one_or_none()
+    return {
+        "disease": DISEASE_NAME,
+        "disease_efo_id": DISEASE_EFO_ID,
+        "target_count": db.query(Target).count(),
+        "last_analysis": latest_analysis.isoformat() if latest_analysis else None,
+    }
 
 
 @router.post("/seed", response_model=list[TargetOut])

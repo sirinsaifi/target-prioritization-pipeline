@@ -86,6 +86,24 @@
   --contra-unclass: #6b7280;
   --contra-unclass-bg: #f3f4f6;
 
+  /* Pink brand palette — this project's own color, deliberately distinct
+     from OTP's blue. Used by the landing page (deep rose canvas + pink
+     particle network + pink-accented branding). */
+  --pink-50:  #fdf2f7;
+  --pink-100: #fce7f3;
+  --pink-200: #fbcfe8;
+  --pink-300: #f9a8da;
+  --pink-400: #f472b6;
+  --pink-500: #ec4899;
+  --pink-600: #db2777;
+  --pink-700: #be185d;
+  /* Landing page gradient and particle colors, derived from the palette
+     above but named descriptively so the intent is clear at the call site. */
+  --landing-bg:      #2a0a1a;  /* deep rose, near-black — full-viewport canvas bg */
+  --landing-node:    var(--pink-400);
+  --landing-line:    var(--pink-500);
+  --landing-accent:  var(--pink-700);
+
   --radius-sm: 4px;
   --radius:    8px;
   --radius-md: 10px;
@@ -239,6 +257,9 @@ body {
 }
 .nav-item:hover { background: var(--nav-hover); color: var(--nav-text-hi); }
 .nav-item.active { background: var(--nav-active); color: #ffffff; font-weight: 500; }
+/* Home nav item keeps its pink accent even when active (vs. the blue
+   active bg used by the other Workspace items). */
+.nav-item.home-active { background: rgba(222, 24, 119, 0.15); color: var(--pink-500); font-weight: 500; }
 
 /* Separator */
 .sep { height: 1px; background: rgba(255,255,255,0.08); margin: 6px 0; }

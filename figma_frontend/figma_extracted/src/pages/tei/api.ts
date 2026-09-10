@@ -256,6 +256,13 @@ interface ApiTarget {
   disease_efo_id: string
 }
 
+interface ApiContext {
+  disease: string
+  disease_efo_id: string
+  target_count: number
+  last_analysis: string | null
+}
+
 interface ApiEvidenceRecord {
   id: number
   target_id: number
@@ -584,6 +591,23 @@ async function buildWhyThisTarget(targetId: number): Promise<WhyThisTarget | nul
 }
 
 /* ─── Public API ───────────────────────────────────────────────────────── */
+
+export interface WorkspaceContext {
+  disease: string
+  diseaseEfoId: string
+  targetCount: number
+  lastAnalysis: string | null
+}
+
+export async function fetchWorkspaceContext(): Promise<WorkspaceContext> {
+  const context = await apiGet<ApiContext>('/targets/context')
+  return {
+    disease: context.disease,
+    diseaseEfoId: context.disease_efo_id,
+    targetCount: context.target_count,
+    lastAnalysis: context.last_analysis,
+  }
+}
 
 export async function fetchTargetList(): Promise<{ id: number; gene: string }[]> {
   const targets = await apiGet<ApiTarget[]>('/targets/')

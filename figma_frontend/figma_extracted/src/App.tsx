@@ -3,19 +3,21 @@ import TargetList from './pages/tei/TargetList'
 import TargetDetail, { type TabId } from './pages/tei/TargetDetail'
 import PortfolioComparison from './pages/tei/PortfolioComparison'
 import EvidenceRiskGapMatrix from './pages/tei/EvidenceRiskGapMatrix'
+import HomePage from './pages/tei/HomePage'
 import type { Target } from './pages/tei/data'
 import { fetchTargetSummaries } from './pages/tei/api'
 
-type Screen = 'targets' | 'portfolio' | 'settings'
+type Screen = 'home' | 'targets' | 'portfolio' | 'settings'
 
 const NAV: { id: Screen; label: string; icon: string }[] = [
+  { id: 'home',      label: 'Home',              icon: '⚡' },
   { id: 'targets',   label: 'Targets',           icon: 'M' },
   { id: 'portfolio', label: 'Portfolio Compare', icon: 'P' },
   { id: 'settings',  label: 'Disease Settings',  icon: 'S' },
 ]
 
 export default function App() {
-  const [screen, setScreen]         = useState<Screen>('targets')
+  const [screen, setScreen]         = useState<Screen>('home')
   const [selected, setSelected]     = useState<Target | null>(null)
   const [selectedTab, setSelectedTab] = useState<TabId | undefined>(undefined)
   const [targets, setTargets]       = useState<Target[] | null>(null)
@@ -91,6 +93,18 @@ export default function App() {
           <div style={{ fontSize: 10, fontWeight: 600, letterSpacing: '0.08em', color: 'rgba(184,200,219,0.5)', textTransform: 'uppercase', padding: '4px 8px 8px' }}>
             Workspace
           </div>
+          <button
+            className={`nav-item ${screen === 'home' && !selected ? 'home-active' : ''}`}
+            onClick={() => { setScreen('home'); setSelected(null) }}
+            style={{ color: 'var(--pink-500)' }}
+          >
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.4">
+              <path d="M3 6l4-4 4 4" strokeLinecap="round" strokeLinejoin="round" />
+              <path d="M5 6V2h4v4" strokeLinecap="round" strokeLinejoin="round" />
+              <rect x="2" y="6" width="10" height="7" rx="1.5" />
+            </svg>
+            Home
+          </button>
           <button
             className={`nav-item ${screen === 'targets' && !selected ? 'active' : ''}`}
             onClick={() => { setScreen('targets'); setSelected(null) }}
@@ -208,6 +222,17 @@ export default function App() {
         <div style={{ flex: 1, padding: '28px 28px 48px' }}>
           {screen === 'settings' ? (
             <SettingsPlaceholder />
+          ) : screen === 'home' && !selected ? (
+            /* Landing page: always renders (even on backend error) because
+               the HomePage component has its own graceful error display and
+               its own lightweight fetch fallback. Clicking a gene chip or
+               search result navigates to that target's detail page and
+               switches the sidebar to "Targets" so Back returns to the list. */
+            <HomePage
+              targets={targets}
+              loadError={loadError}
+              onSelectTarget={(t) => { setScreen('targets'); handleSelectTarget(t) }}
+            />
           ) : loadError ? (
             <div style={{ maxWidth: 600 }}>
               <h1 style={{ fontSize: 20, fontWeight: 700, color: 'var(--ink-1)', margin: '0 0 6px' }}>Could not reach the backend</h1>
