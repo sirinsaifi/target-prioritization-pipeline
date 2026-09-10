@@ -19,7 +19,7 @@ def list_targets(db: Session = Depends(get_db)):
 @router.get("/context")
 def get_context(db: Session = Depends(get_db)):
     """Return the active disease context and latest persisted analysis timestamp."""
-    latest_analysis = db.query(func.max(PipelineRunLog.run_at)).scalar_one_or_none()
+    latest_analysis = db.query(func.max(PipelineRunLog.run_at)).scalar()
     return {
         "disease": DISEASE_NAME,
         "disease_efo_id": DISEASE_EFO_ID,
