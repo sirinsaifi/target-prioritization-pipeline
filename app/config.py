@@ -225,6 +225,17 @@ DIMENSIONS_WITH_SCORING_FORMULA_LIMITATIONS = {"ppi_network"}
 # silently worked around.
 EXPRESSION_ATLAS_DATASOURCE_ID = "expression_atlas"
 
+# UPDATE (Sep 2026): The DIRECT Expression Atlas REST API at
+# https://www.ebi.ac.uk/gxa IS actively maintained (4,562 studies)
+# and reachable via its own API (expression_atlas_direct_client.py).
+# Only OTP's routing to it is broken/retired. The direct API returns
+# real baseline TPM data for all 5 ALS genes (confirmed live for
+# SOD1, C9orf72, TARDBP, FUS, NEK1) and real differential-expression
+# foldChange+pValue data across 5 human ALS experiments.
+# New omics data now flows through data_source="expression_atlas_direct",
+# not via the old OTP "expression_atlas" route — see
+# scripts/ingest_evidence.py's Expression Atlas Direct block.
+
 # Omics/Expression Atlas significance gate (OTP precedent, per
 # docs/04_scoring_elements_needed.md item 10): |log2FC| > 1 and adjusted
 # p-value <= 0.05 required for inclusion, mirroring L2G_INCLUSION_THRESHOLD's

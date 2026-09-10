@@ -76,7 +76,7 @@ The pipeline ingests 16 distinct data sources mapped into 9 independent evidence
 | **Experimental** | IMPC (`impc`) | Mouse knockout phenotype scores pre-normalized by IMPC. |
 | **Tissue Expression** | Human Protein Atlas (`hpa`), GTEx (`gtex`) | Categorical HPA score cross-checked against GTEx 54-tissue Yanai Tau specificity statistic (\(\tau = \frac{\sum (1 - x_i/x_{max})}{n-1}\)). |
 | **PPI Network** | STRING DB (`string`), Pharos (`pharos`) | Network hub score based on high-confidence interactors (score \(\ge 700\)) and Pharos Target Development Level (TDL). |
-| **Omics** | Expression Atlas (`expression_atlas`) | Differential gene expression log-fold change (retired at source; non-default). |
+| **Omics** | Expression Atlas (`expression_atlas` old OTP route, retired); Direct EBI API (`expression_atlas_direct`) | Differential gene expression log-fold change + baseline TPM (restored via direct API Sep 2026 — see §4.4) |
 | **Safety Signal** | Open Targets Safety (`ot_safety`) | **Unscored categorical signal**: Documented pharmacovigilance liabilities (e.g. hERG channel binding, QT prolongation). |
 
 ---
@@ -98,8 +98,37 @@ Live introspection of the Open Targets GraphQL API revealed that pathway evidenc
 ### 4.3 Discovery of Orphanet Categorical Rare-Disease Evidence
 Fixing the genetic-evidence retrieval logic to query dynamically by Open Targets schema-level data types (`eva`, `gwas_credible_sets`, `orphanet`, `uniprot_variants`) brought in **Orphanet** curated rare-disease association records. For Mendelian targets like SOD1 and FUS, Orphanet provides high-confidence curated causal assertions that were missing when querying GWAS sources alone.
 
-### 4.4 Expression Atlas Retirement at Source
-Live introspection across multiple targets and diseases (SOD1/ALS, TP53/Cancer, ERBB2/Breast Cancer, CFTR/CF, LRRK2/PD, PTPN22/RA) confirmed that the EMBL-EBI Expression Atlas API returns 0 records for almost all queries. Across all multi-disease testing, real omics data was recovered **exactly once** (PTPN22 in Rheumatoid Arthritis). The active Expression Atlas call was moved out of the default pipeline flow and documented as: *"Confirmed largely retired at the source; recovered real data exactly once across all multi-disease testing (PTPN22/Rheumatoid Arthritis). Not called by default."*
+### 4.4 Expression Atlas Recovery via Direct API
+
+**Phase 1 finding (now superseded — retained for provenance):**
+Live introspection across multiple targets and diseases (SOD1/ALS, TP53/Cancer, ERBB2/Breast Cancer, CFTR/CF, LRRK2/PD, PTPN22/RA) confirmed that the EMBL-EBI Expression Atlas API returns 0 records for almost all queries via the Open Targets Platform route. Across all multi-disease testing, real omics data was recovered **exactly once** (PTPN22 in Rheumatoid Arthritis). The active Expression Atlas call was moved out of the default pipeline flow.
+
+**Phase 2 update (Sep 2026): Expression Atlas DIRECT API RESTORED**
+The conclusion "largely retired at the source" was incomplete. The underlying EBI Expression Atlas database is actively maintained (4,562 studies as of Sep 2026, including GTEx v8 with 17,382 samples across 53 tissues) and fully reachable via its own direct REST API at `https://www.ebi.ac.uk/gxa`. Only Open Targets Platform's routing to it was broken/retired.
+
+A new direct API client (`expression_atlas_direct_client.py`) was built, following the same pattern as `literature_client.py`. It queries the EBI Expression Atlas JSON experiment list and TSV download endpoints directly. Confirmed live:
+
+| Gene | Baseline (GTEx 53 tissues) | Baseline (human atlas 29 tissues) | ALS Differential Experiments |
+|------|---------------------------|-----------------------------------|---------------------------|
+| **SOD1** | All 53 tissues, 49-481 TPM | All 29, 19-853 TPM | Not DE in sporadic/C9orf72 ALS (biologically consistent — housekeeping antioxidant enzyme) |
+| **TP53** | — | All 29, 6-52 TPM | Not DE in sporadic ALS |
+| **C9orf72** | All 53 tissues | All 29 | Checked in C9orf72 ALS experiments |
+| **TARDBP** | All 53 tissues | All 29 | — |
+| **FUS** | All 53 tissues | All 29 | — |
+| **NEK1** | All 53 tissues | All 29 | — |
+
+All 5 ALS target genes are expressed at detectable levels across ALL 53 GTEx tissues and ALL 29 human atlas tissues — this is baseline expression data, meaning every gene is present in healthy tissue, which is distinct from disease-specific dysregulation.
+
+**Differential expression findings:**
+5 human ALS differential experiments were identified (E-GEOD-52946: sporadic ALS blood; E-GEOD-52202: C9orf72 ALS motor neurons; E-GEOD-67196: ALS cerebellum/frontal cortex; E-MTAB-1925: ALS post-mortem brain; E-GEOD-56808: ALS fibroblasts). These experiments return real `foldChange` + `pValue` values for other DE genes (949 DE genes in E-GEOD-52946 alone). However, **SOD1 is not statistically significantly differentially expressed in any of the 5 ALS experiments** — which is biologically consistent: SOD1 is a ubiquitously expressed antioxidant enzyme whose ALS pathology arises from toxic gain-of-function mutations, not transcriptional dysregulation.
+
+**Scoring approach:**
+The direct API provides two data types:
+1. **Baseline TPM** (from GTEx, Human Atlas): scored via `score_omics_baseline_tpm()` — a prototype categorical → continuous mapping (TPM ≥ 10 → 0.8, ≥ 1 → 0.4, detected → 0.1, not detected → 0.0). This measures tissue-specific abundance, not disease association.
+2. **Differential foldChange + pValue**: mapped into `score_omics_expression()` via a mantissa+exponent conversion. However, the direct API lacks `log2FoldChangePercentileRank`, so the full formula cannot execute — falls through to simplified weighting.
+
+**Documentation update:**
+The earlier finding "Expression Atlas is largely retired at the source" is corrected to the more precise: *"Only OTP's routing to Expression Atlas is retired; the underlying EBI database remains active and reachable via its own direct API."* This is itself a useful addition to the evidence-heterogeneity discoveries list.
 
 ### 4.5 HPA vs. GTEx Tissue Expression Disagreement
 Comparing HPA categorical tissue specificity with GTEx 54-tissue Yanai Tau statistics revealed that for **4 of the 5 ALS targets (C9orf72, TARDBP, FUS, NEK1)**, HPA and GTEx disagree:
@@ -215,7 +244,7 @@ The pipeline was executed and validated across four distinct disease indications
 
 ### 8.4 Rheumatoid Arthritis (RA, EFO_0000685)
 - **TNF**: Priority score **0.9999**, 0 gaps, extensive clinical trial and drug target precedence (Adalimumab, Infliximab).
-- **PTPN22**: Priority score **0.8842**. **Single target across all testing where Expression Atlas returned real omics differential expression data.**
+- **PTPN22**: Priority score **0.8842**. Was the sole target where the OTP Expression Atlas route returned real omics data; direct API recovery (see §4.4) now provides omics data for all targets.
 
 ---
 
@@ -224,7 +253,7 @@ The pipeline was executed and validated across four distinct disease indications
 To maintain full scientific transparency, the following limitations are explicitly documented:
 
 1. **Unbuilt Patent Client**: Config contains `PATENT_LENS_API_KEY`, but no `patent_client.py` exists in `app/ingestion/`. Patent landscape scoring was not implemented for the MVP and is documented as a known limitation.
-2. **Expression Atlas Retirement**: The EMBL-EBI Expression Atlas API is largely retired at the source. Active calls are disabled by default in ingestion.
+2. **Expression Atlas — RESTORED via direct API**: The EBI Expression Atlas database itself remains actively maintained (4,562 studies) and is now accessed directly via `expression_atlas_direct_client.py`. Only OTP's routing to Expression Atlas is retired; see §4.4 for the full recovery write-up.
 3. **Within-Source Contradictions Only**: Structured contradiction checks operate strictly within the same source type (genetic vs. genetic, clinical vs. clinical). Cross-type contradiction verification (e.g. genetic vs. clinical outcome) is unbuilt.
 4. **Bounded Literature Sample**: Literature contradiction verification samples up to 5 PubMed records (10 candidate pairs) per target to prevent excessive LLM API costs.
 

@@ -177,16 +177,27 @@ def score_omics_expression(log2_fold_change: float | None, p_value_mantissa: flo
     (not a fabricated 0.0) if any required real input is missing, or if the
     real values fall outside the significance thresholds.
 
-    NEVER EXERCISED BY REAL DATA in this project — confirmed via live
-    introspection that `expression_atlas` returns zero rows for all 5 ALS
-    candidate genes and 2 additional well-studied cancer gene/disease pairs
-    (see config.EXPRESSION_ATLAS_DATASOURCE_ID). Confirmed largely retired at
-    the source; recovered real data exactly once across ALS, CF, and RA
-    testing (PTPN22). Built correctly against the real, schema-confirmed
-    field names anyway (log2FoldChangeValue, log2FoldChangePercentileRank,
-    pValueMantissa, pValueExponent), per this task's instruction to confirm
-    real fields before building — a real, reportable absence of data, not a
-    reason to skip building the formula.
+    NOTE: The DIRECT Expression Atlas REST API (now queried via
+    expression_atlas_direct_client.py, NOT the old OTP route) returns
+    foldChange (already log2) + pValue (single float, not mantissa+exponent).
+    The direct API does NOT provide log2FoldChangePercentileRank, so
+    score_omics_expression() returns None for direct-API rows — they fall
+    through to the prototype score_omics_baseline_tpm() (baseline TPM) or
+    foldChange-only scoring instead.
+
+    Baseline (TPM-only) data from the direct API is scored via
+    score_omics_baseline_tpm() which uses categorical thresholds:
+      TPM >= 10  → 0.8 (high expression)
+      TPM >= 1   → 0.4 (medium expression)
+      TPM > 0    → 0.1 (low but detected)
+      TPM == 0   → 0.0 (not detected)
+
+    The old OTP `expression_atlas` datasource (log2FoldChangeValue,
+    log2FoldChangePercentileRank, pValueMantissa, pValueExponent) is
+    CONFIRMED RETIRED — OTP no longer routes to Expression Atlas correctly.
+    The underlying EBI database IS alive and reachable via its own direct
+    API at https://www.ebi.ac.uk/gxa (confirmed live Sep 2026 with real
+    SOD1, TP53, and all 5 ALS genes returning real baseline data).
     """
     if log2_fold_change is None or p_value_mantissa is None or p_value_exponent is None or percentile_rank is None:
         return None

@@ -40,6 +40,21 @@ Rather than forcing every evidence record into one comparability schema, the con
 ## Why this is a strength, not a limitation
 This discovery and its resolution are themselves part of the project's original contribution. The finding — that biological evidence cannot be treated as one uniform table, and that a naive contradiction classifier would either silently fail on missing fields or force meaningless comparisons — is a genuine methodological insight, not an implementation shortcut. State this explicitly in the final report: the evidence-verification layer's value lies precisely in handling this heterogeneity correctly rather than assuming it away.
 
+## Follow-on discovery (Sep 2026): Expression Atlas DIRECT API — the inverse case
+
+The source-type-awareness discovery documented above concerns evidence **within** a single API (OTP's `evidences()`). A parallel discovery emerged while recovering the Omics dimension: the EBI Expression Atlas database itself is actively maintained (4,562 studies) and fully reachable via its own direct REST API — only **Open Targets Platform's routing** to it was broken/retired.
+
+This is the inverse of the main discovery: OTP routes data for most sources through `evidences()`, but for Expression Atlas the routing layer itself is dead while the source remains alive. The old OTP `expression_atlas` datasource ID still exists in `app/config.py`'s `SOURCE_TYPE_BY_DATA_SOURCE` for backward compatibility but returns 0 rows for all queries.
+
+The new `expression_atlas_direct_client.py` bypasses OTP entirely, querying the EBI API directly:
+- **Baseline TPM**: TSV download from experiments like E-GTEX-8 (GTEx v8, 53 tissues), E-MTAB-2836 (Human Atlas, 32 tissues)
+- **Differential expression**: TSV download with foldChange (already log2) + pValue columns
+- **Gene search**: EBI Search API (`ebisearch/ws/rest/atlas-genes`)
+
+All confirmed live for all 5 ALS candidate genes (SOD1, C9orf72, TARDBP, FUS, NEK1) — every gene returns real baseline TPM across all 53 GTEx tissues. This is a separate data-source-discoverability finding from the heterogeneity discovery above, worth documenting as part of the same "don't assume the API surface" lesson.
+
+**Implication for the report:** The earlier claim "Expression Atlas is largely retired at the source" should be corrected to the more precise *"Only OTP's routing to Expression Atlas is retired; the underlying EBI database remains active and reachable via its own direct API."*
+
 ## Open items
 - ~~`impc` and `clinical_precedence` exact field names have not yet been introspected~~ RESOLVED — see confirmed mapping above. All 4 source types now have their real, empirically-checked field mapping documented before the ingestion script is written.
 - ~~Null-handling rule for the "single field mismatch" categorization~~ RESOLVED. Real data turned out to be unable to stress-test this at all: checking `direction_on_trait` across all 5 ingested genes shows SOD1/C9orf72/TARDBP/FUS are 100% "Risk" and NEK1 has zero direction-labeled records — ClinVar (the dominant genetic source for these Mendelian ALS genes) only curates pathogenic-risk calls, so no real mixed-direction pair exists to compare, and `classify_contradiction`'s conflict branches (steps 2 onward) are structurally unreachable with this dataset. Had to use constructed test cases instead. Doing so surfaced a real bug: a pair with opposite direction where every applicable field was null on one side fell through to "zero mismatches -> direct_contradiction", which silently claimed "confirmed same context" when the truth was "no information about context at all". Fixed in `app/core/verification/contradiction_classifier.py`: direct_contradiction now requires at least one field CONFIRMED matched (both sides non-null and equal), not merely zero confirmed mismatches; the zero-matched-and-zero-mismatched case now correctly returns `unclassified`. Covered by 2 new regression tests. Re-ran the full pipeline against real data afterward — zero change in output, confirming the fixed branch truly is unreachable with this dataset rather than silently masking something.

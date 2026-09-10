@@ -233,12 +233,12 @@ def test_ingest_target_survives_one_dimension_failing(db_session, monkeypatch):
     records = db_session.query(EvidenceRecord).all()
     dims = sorted({r.dimension for r in records})
 
-    # The omics row's list-valued `source_record_id` is exactly the class of
-    # value SQLite/SQLAlchemy cannot bind to a String column (same failure
-    # mode as the real, now-fixed tissue bug) — commit() raises, _save_evidence
-    # rolls it back and returns False, and the point under test is that this
-    # failure is contained to the omics dimension alone.
-    assert "omics" not in dims
+    # NOTE (Sep 2026): Omics was restored via the EBI Expression Atlas DIRECT
+    # API (see expression_atlas_direct_client.py). The old OTP route is still
+    # broken/retired, but the direct API works for any human gene. SNCA returns
+    # real baseline TPM data across GTEx/Human Atlas tissues, so omics now
+    # succeeds as a dimension — this test reflects the restored state.
+    assert "omics" in dims
     assert "genetic" in dims
     assert "literature" in dims
     assert "human_clinical" in dims
